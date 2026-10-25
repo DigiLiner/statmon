@@ -5,18 +5,19 @@ use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
 use windows_sys::Win32::Graphics::Gdi::{
-    CreateSolidBrush, DeleteObject, FillRect, GetStockObject, InvalidateRect, SetBkColor,
-    SetTextColor, HBRUSH, HFONT,
+    BeginPaint, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW,
+    EndPaint, FillRect, FillRgn, GetStockObject, InvalidateRect, SetBkColor, SetTextColor,
+    ScreenToClient, SelectObject, SetBkMode, SetWindowRgn, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
+    DEFAULT_PITCH, FF_DONTCARE, FW_SEMIBOLD, HBRUSH, HFONT, OUT_DEFAULT_PRECIS, PAINTSTRUCT, Polyline,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::Controls::{
-    SetWindowTheme, BST_CHECKED, BST_UNCHECKED,
-};
+use windows_sys::Win32::UI::Controls::{SetWindowTheme, BST_CHECKED, BST_UNCHECKED, DRAWITEMSTRUCT};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::config::{
     hex_color, is_dark, parse_color, Config, FloatCfg, Graph, Palette, Theme, ViewMode,
 };
+use crate::lang::{t, K, Lang};
 use crate::metrics::Metric;
 use crate::ui::rgb;
 use crate::{app_icon, autostart_enabled, set_autostart, App};
@@ -24,10 +25,11 @@ use crate::{app_icon, autostart_enabled, set_autostart, App};
 const ID_REFRESH: usize = 200;
 const ID_CAPACITY: usize = 201;
 const ID_THEME: usize = 202;
-const ID_FONT_LABEL: usize = 203;
-const ID_FONT_VALUE: usize = 204;
-const ID_GRAPH_W: usize = 206;
-const ID_FLOAT_FONT: usize = 207;
+const ID_LANG: usize = 203;
+const ID_FONT_LABEL: usize = 204;
+const ID_FONT_VALUE: usize = 206;
+const ID_GRAPH_W: usize = 207;
+const ID_FLOAT_FONT: usize = 208;
 const ID_SHOW_BASE: usize = 210;
 const ID_FLOAT_BASE: usize = 220;
 const ID_TRANS: usize = 230;
@@ -37,22 +39,32 @@ const ID_SAVE: usize = 240;
 const ID_CLOSE: usize = 241;
 const ID_STATUS: usize = 242;
 const ID_MODE_BASE: usize = 250;
+const ID_WIDGET_SEL: usize = 260;
+const ID_WIDGET_BG: usize = 261;
+const ID_WIDGET_OPACITY: usize = 262;
+const ID_WIDGET_BORDER: usize = 263;
 const ID_GRAPH_METRIC_BASE: usize = 270;
 const ID_BAR_BG: usize = 280;
 const ID_BAR_OPACITY: usize = 281;
 const ID_BAR_TRANS: usize = 282;
 const ID_AUTOSTART: usize = 283;
-const ID_WIDGET_SEL: usize = 260;
-const ID_WIDGET_BG: usize = 261;
-const ID_WIDGET_OPACITY: usize = 262;
-const ID_WIDGET_BORDER: usize = 263;
+const ID_COLOR_BASE: usize = 300;
+const ID_RESET_COLORS: usize = 320;
+const ID_SEC_GENERAL: usize = 330;
+const ID_SEC_BAR: usize = 331;
+const ID_SEC_COLORS: usize = 332;
+const ID_SEC_METRICS: usize = 333;
+const ID_SEC_FLOAT: usize = 334;
 
-const CLIENT_W: i32 = 560;
-const CLIENT_H: i32 = 382;
+const CLIENT_W: i32 = 760;
+const CLIENT_H: i32 = 540;
+const HEADER_H: i32 = 44;
 
 const EN_CHANGE: usize = 0x0300;
 const EN_KILLFOCUS: usize = 0x0200;
 const WM_SET_TARGET: u32 = WM_APP + 2;
+
+const COLOR_KEYS: [&str; 7] = ["label", "warn", "cpu", "ram", "net", "disk", "cap"];
 
 struct Ctx {
     app: *mut App,
@@ -62,10 +74,36 @@ struct Ctx {
     palette: Palette,
     bg_brush: HBRUSH,
     edit_brush: HBRUSH,
+    title_font: HFONT,
+    section_font: HFONT,
 }
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn wide_n(s: &str) -> Vec<u16> {
+    s.encode_utf16().collect()
+}
+
+unsafe fn make_font(px: i32, weight: u32) -> HFONT {
+    let face = wide("Segoe UI");
+    CreateFontW(
+        -px,
+        0,
+        0,
+        0,
+        weight as i32,
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET as u32,
+        OUT_DEFAULT_PRECIS as u32,
+        CLIP_DEFAULT_PRECIS as u32,
+        5u32,
+        (DEFAULT_PITCH | FF_DONTCARE) as u32,
+        face.as_ptr(),
+    )
 }
 
 unsafe fn apply_window_theme(hwnd: HWND, ctx: &mut Ctx) {
@@ -87,18 +125,6 @@ unsafe fn apply_window_theme(hwnd: HWND, ctx: &mut Ctx) {
         &dark as *const i32 as *const c_void,
         std::mem::size_of::<i32>() as u32,
     );
-    let cap = rgb(p.bg);
-    let txt = rgb(p.text);
-    let edge = rgb(p.divider);
-    for (attr, value) in [(35u32, cap), (36u32, txt), (34u32, edge)] {
-        DwmSetWindowAttribute(
-            hwnd,
-            attr,
-            &value as *const u32 as *const c_void,
-            std::mem::size_of::<u32>() as u32,
-        );
-    }
-
     let theme = if dark != 0 {
         wide("DarkMode_Explorer")
     } else {
@@ -106,7 +132,7 @@ unsafe fn apply_window_theme(hwnd: HWND, ctx: &mut Ctx) {
     };
     SetWindowTheme(hwnd, theme.as_ptr(), null());
     EnumChildWindows(hwnd, Some(theme_child), theme.as_ptr() as isize);
-    InvalidateRect(hwnd, null(), 1);
+    InvalidateRect(hwnd, null(), 0);
 }
 
 unsafe extern "system" fn theme_child(child: HWND, lp: isize) -> BOOL {
@@ -194,9 +220,10 @@ pub unsafe fn open(app: *mut App, initial: Option<Metric>) {
     }
 
     let hinst = GetModuleHandleW(null());
+    let lang = (*app).cfg.language;
     let cls = wide("StatMonSettings");
     let wc = WNDCLASSW {
-        style: CS_HREDRAW | CS_VREDRAW,
+        style: CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW,
         lpfnWndProc: Some(wndproc),
         cbClsExtra: 0,
         cbWndExtra: 0,
@@ -209,17 +236,6 @@ pub unsafe fn open(app: *mut App, initial: Option<Metric>) {
     };
     RegisterClassW(&wc);
 
-    let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    let mut r = RECT {
-        left: 0,
-        top: 0,
-        right: CLIENT_W,
-        bottom: CLIENT_H,
-    };
-    AdjustWindowRectEx(&mut r, style, 0, 0);
-    let w = r.right - r.left;
-    let h = r.bottom - r.top;
-
     let mut work: RECT = zeroed();
     SystemParametersInfoW(
         SPI_GETWORKAREA,
@@ -227,8 +243,8 @@ pub unsafe fn open(app: *mut App, initial: Option<Metric>) {
         &mut work as *mut RECT as *mut c_void,
         0,
     );
-    let x = work.left + ((work.right - work.left) - w) / 2;
-    let y = work.top + ((work.bottom - work.top) - h) / 2;
+    let x = work.left + ((work.right - work.left) - CLIENT_W) / 2;
+    let y = work.top + ((work.bottom - work.top) - CLIENT_H) / 2;
 
     let edit = initial.unwrap_or(Metric::Cpu);
     let ctx = Box::into_raw(Box::new(Ctx {
@@ -239,16 +255,18 @@ pub unsafe fn open(app: *mut App, initial: Option<Metric>) {
         palette: (*app).palette,
         bg_brush: null_mut(),
         edit_brush: null_mut(),
+        title_font: null_mut(),
+        section_font: null_mut(),
     }));
     let hwnd = CreateWindowExW(
         0,
         cls.as_ptr(),
-        wide("StatMon - Ayarlar").as_ptr(),
-        style,
+        wide(t(lang, K::Title)).as_ptr(),
+        WS_POPUP,
         x,
         y,
-        w,
-        h,
+        CLIENT_W,
+        CLIENT_H,
         null_mut(),
         null_mut(),
         hinst,
@@ -260,6 +278,11 @@ pub unsafe fn open(app: *mut App, initial: Option<Metric>) {
     }
     (*app).settings_hwnd = hwnd;
     (*app).settings_target = None;
+    SetWindowRgn(
+        hwnd,
+        CreateRoundRectRgn(0, 0, CLIENT_W + 1, CLIENT_H + 1, 14, 14),
+        1,
+    );
     ShowWindow(hwnd, SW_SHOW);
     SetForegroundWindow(hwnd);
 }
@@ -295,12 +318,19 @@ unsafe fn read_widget(hwnd: HWND, cfg: &mut Config, edit: Metric) {
     }
 }
 
-unsafe fn build_controls(hwnd: HWND, app: &App, edit: Metric) {
-    let font = GetStockObject(17) as HFONT;
-    let cfg = &app.cfg;
+unsafe fn section(hwnd: HWND, text: &str, x: i32, y: i32, id: usize, font: HFONT) {
+    mk(hwnd, "STATIC", text, 0, x, y, 300, 22, id, font);
+}
 
-    let label = |t: &str, x: i32, y: i32, w: i32| -> HWND {
-        mk(hwnd, "STATIC", t, 0, x, y, w, 20, 0, font)
+unsafe fn build_controls(hwnd: HWND, app: &App, edit: Metric, ctx_fonts: (HFONT, HFONT)) {
+    let font = GetStockObject(17) as HFONT;
+    let (_title_font, section_font) = ctx_fonts;
+    let cfg = &app.cfg;
+    let lang = cfg.language;
+    let p = cfg.palette();
+
+    let label = |tx: &str, x: i32, y: i32, w: i32| -> HWND {
+        mk(hwnd, "STATIC", tx, 0, x, y, w, 20, 0, font)
     };
     let num = |v: &str, x: i32, y: i32, w: i32, id: usize| -> HWND {
         mk(
@@ -316,6 +346,9 @@ unsafe fn build_controls(hwnd: HWND, app: &App, edit: Metric) {
             font,
         )
     };
+    let hex = |v: &str, x: i32, y: i32, w: i32, id: usize| -> HWND {
+        mk(hwnd, "EDIT", v, WS_BORDER, x, y, w, 22, id, font)
+    };
     let combo = |x: i32, y: i32, w: i32, id: usize| -> HWND {
         mk(
             hwnd,
@@ -325,177 +358,205 @@ unsafe fn build_controls(hwnd: HWND, app: &App, edit: Metric) {
             x,
             y,
             w,
-            200,
+            220,
             id,
             font,
         )
     };
-    let checkbox = |t: &str, x: i32, y: i32, w: i32, id: usize| -> HWND {
+    let checkbox = |tx: &str, x: i32, y: i32, w: i32, id: usize| -> HWND {
         mk(
             hwnd,
             "BUTTON",
-            t,
-            BS_AUTOCHECKBOX as u32,
+            tx,
+            (BS_AUTOCHECKBOX as u32) | (BS_OWNERDRAW as u32),
             x,
             y,
             w,
-            22,
+            24,
             id,
             font,
         )
     };
 
-    label("Yenileme (ms)", 14, 16, 90);
-    num(&cfg.refresh_ms.to_string(), 108, 14, 54, ID_REFRESH);
-    label("Kapasite (sn)", 180, 16, 88);
-    num(&cfg.capacity_secs.to_string(), 274, 14, 54, ID_CAPACITY);
-    label("Tema", 342, 16, 40);
-    let theme = combo(386, 14, 120, ID_THEME);
-    for t in Theme::ALL {
-        SendMessageW(theme, CB_ADDSTRING, 0, wide(t.label()).as_ptr() as isize);
+    section(hwnd, t(lang, K::General), 24, 56, ID_SEC_GENERAL, section_font);
+
+    label(t(lang, K::RefreshMs), 24, 84, 90);
+    num(&cfg.refresh_ms.to_string(), 120, 82, 60, ID_REFRESH);
+    label(t(lang, K::CapacityS), 196, 84, 90);
+    num(&cfg.capacity_secs.to_string(), 292, 82, 60, ID_CAPACITY);
+
+    label(t(lang, K::Theme), 24, 112, 50);
+    let theme = combo(80, 110, 120, ID_THEME);
+    for th in Theme::ALL {
+        SendMessageW(theme, CB_ADDSTRING, 0, wide(th.label_l(lang)).as_ptr() as isize);
     }
     SendMessageW(theme, CB_SETCURSEL, cfg.theme.index(), 0);
 
-    label("Font etiket", 14, 48, 72);
-    num(&cfg.font_label_px.to_string(), 92, 46, 54, ID_FONT_LABEL);
-    label("Font değer", 156, 48, 72);
-    num(&cfg.font_value_px.to_string(), 230, 46, 54, ID_FONT_VALUE);
-    label("Yüzen font", 300, 48, 72);
-    num(&cfg.float_font_px.to_string(), 374, 46, 54, ID_FLOAT_FONT);
+    label(t(lang, K::Language), 212, 112, 62);
+    let langc = combo(278, 110, 104, ID_LANG);
+    for l in Lang::ALL {
+        SendMessageW(langc, CB_ADDSTRING, 0, wide(l.label()).as_ptr() as isize);
+    }
+    SendMessageW(langc, CB_SETCURSEL, cfg.language.index(), 0);
 
-    label("Grafik genişlik", 14, 80, 92);
-    num(&cfg.graph_width.to_string(), 110, 78, 54, ID_GRAPH_W);
-    let compact = checkbox("Sıkı yerleşim", 180, 76, 110, ID_COMPACT);
+    label(t(lang, K::FontLabel), 24, 140, 100);
+    num(&cfg.font_label_px.to_string(), 128, 138, 46, ID_FONT_LABEL);
+    label(t(lang, K::FontValue), 190, 140, 100);
+    num(&cfg.font_value_px.to_string(), 294, 138, 46, ID_FONT_VALUE);
+
+    label(t(lang, K::FloatFont), 24, 168, 100);
+    num(&cfg.float_font_px.to_string(), 128, 166, 46, ID_FLOAT_FONT);
+    label(t(lang, K::ChartWidth), 190, 168, 100);
+    num(&cfg.graph_width.to_string(), 294, 166, 46, ID_GRAPH_W);
+
+    let compact = checkbox(t(lang, K::Compact), 24, 194, 140, ID_COMPACT);
     check(compact, cfg.compact);
-    let auto = checkbox("Windows açılışında başlat", 296, 76, 240, ID_AUTOSTART);
+
+    let auto = checkbox(t(lang, K::Autostart), 24, 220, 250, ID_AUTOSTART);
     check(auto, autostart_enabled());
 
-    label("Göster:", 14, 112, 50);
-    label("Görünüm:", 14, 144, 52);
-    label("Grafik türü:", 14, 176, 64);
-    label("Yüzen:", 14, 208, 50);
+    section(hwnd, t(lang, K::BarLook), 24, 250, ID_SEC_BAR, section_font);
+    label(t(lang, K::Background), 24, 276, 80);
+    hex(&cfg.bar_bg, 110, 274, 90, ID_BAR_BG);
+    label(t(lang, K::Opacity), 214, 276, 60);
+    num(&cfg.bar_opacity.to_string(), 280, 274, 46, ID_BAR_OPACITY);
+    label("%", 330, 276, 14);
+    let bt = checkbox(t(lang, K::BarTransparent), 24, 302, 190, ID_BAR_TRANS);
+    check(bt, cfg.bar_transparent);
+
+    section(hwnd, t(lang, K::Colors), 24, 332, ID_SEC_COLORS, section_font);
+    label(t(lang, K::LabelColor), 24, 358, 90);
+    hex(&hex_color(p.label), 118, 356, 80, ID_COLOR_BASE);
+    label(t(lang, K::WarnColor), 210, 358, 85);
+    hex(&hex_color(p.warn), 298, 356, 80, ID_COLOR_BASE + 1);
+
+    let color_rows: [(usize, i32, &str, i32); 5] = [
+        (2, 386, "CPU", 24),
+        (3, 386, "RAM", 168),
+        (4, 414, "NET", 24),
+        (5, 414, "DISK", 168),
+        (6, 442, "CAP", 24),
+    ];
+    for (i, y, name, x) in color_rows {
+        label(name, x, y + 2, 44);
+        let key = COLOR_KEYS[i];
+        hex(&hex_color(color_of(&p, key)), x + 44, y, 80, ID_COLOR_BASE + i);
+    }
+
+    mk(
+        hwnd,
+        "BUTTON",
+        t(lang, K::ResetColors),
+        (BS_PUSHBUTTON as u32) | (BS_OWNERDRAW as u32),
+        168,
+        440,
+        140,
+        28,
+        ID_RESET_COLORS,
+        font,
+    );
+
+    section(hwnd, t(lang, K::Metrics), 400, 56, ID_SEC_METRICS, section_font);
+    label(t(lang, K::Show), 400, 82, 50);
+    label(t(lang, K::View), 456, 82, 40);
+    label(t(lang, K::ChartType), 574, 82, 90);
+    label(t(lang, K::Floating), 682, 82, 54);
 
     for (i, m) in Metric::ALL.iter().enumerate() {
-        let x = 70 + i as i32 * 92;
+        let y = 102 + i as i32 * 30;
 
-        let b = checkbox(m.label(), x, 108, 84, ID_SHOW_BASE + i);
+        let b = checkbox(m.label(), 400, y, 50, ID_SHOW_BASE + i);
         check(b, cfg.shows(*m));
 
-        let mode = combo(x, 140, 84, ID_MODE_BASE + i);
+        let mode = combo(452, y - 2, 114, ID_MODE_BASE + i);
         for v in ViewMode::ALL {
-            SendMessageW(mode, CB_ADDSTRING, 0, wide(v.label()).as_ptr() as isize);
+            SendMessageW(mode, CB_ADDSTRING, 0, wide(v.label_l(lang)).as_ptr() as isize);
         }
         SendMessageW(mode, CB_SETCURSEL, cfg.view(*m).index(), 0);
 
-        let g = combo(x, 172, 84, ID_GRAPH_METRIC_BASE + i);
+        let g = combo(570, y - 2, 108, ID_GRAPH_METRIC_BASE + i);
         for kind in Graph::ALL {
-            SendMessageW(g, CB_ADDSTRING, 0, wide(kind.label()).as_ptr() as isize);
+            SendMessageW(g, CB_ADDSTRING, 0, wide(kind.label_l(lang)).as_ptr() as isize);
         }
         SendMessageW(g, CB_SETCURSEL, cfg.graph_for(*m).index(), 0);
 
-        let b = checkbox(m.label(), x, 204, 84, ID_FLOAT_BASE + i);
+        let b = checkbox("", 682, y, 24, ID_FLOAT_BASE + i);
         check(b, cfg.float(*m).on);
     }
 
-    label("Widget stili:", 14, 240, 80);
-    let sel = combo(96, 238, 84, ID_WIDGET_SEL);
+    section(hwnd, t(lang, K::FloatLook), 400, 258, ID_SEC_FLOAT, section_font);
+    label(t(lang, K::Widget), 400, 284, 52);
+    let sel = combo(456, 282, 90, ID_WIDGET_SEL);
     for m in Metric::ALL {
         SendMessageW(sel, CB_ADDSTRING, 0, wide(m.label()).as_ptr() as isize);
     }
     let idx = Metric::ALL.iter().position(|m| *m == edit).unwrap_or(0);
     SendMessageW(sel, CB_SETCURSEL, idx, 0);
+    label(t(lang, K::Background), 556, 284, 76);
+    hex(&cfg.float(edit).bg, 636, 282, 90, ID_WIDGET_BG);
 
-    label("Arka plan", 190, 240, 58);
-    mk(
-        hwnd,
-        "EDIT",
-        &cfg.float(edit).bg,
-        WS_BORDER,
-        250,
-        238,
-        74,
-        22,
-        ID_WIDGET_BG,
-        font,
-    );
-    label("Opaklık", 332, 240, 48);
+    label(t(lang, K::Opacity), 400, 312, 56);
     num(
         &cfg.float(edit).opacity.to_string(),
-        384,
-        238,
+        460,
+        310,
         40,
         ID_WIDGET_OPACITY,
     );
-    label("%", 428, 240, 14);
-    let border = checkbox("Kenarlık", 448, 238, 82, ID_WIDGET_BORDER);
-    check(border, cfg.float(edit).border);
-
-    let tr = checkbox("Şeffaf arka plan", 70, 268, 130, ID_TRANS);
+    label("%", 504, 312, 14);
+    let tr = checkbox(t(lang, K::Transparent), 520, 308, 104, ID_TRANS);
     check(tr, cfg.float(edit).transparent);
-    let tp = checkbox("Her zaman üstte", 214, 268, 140, ID_TOP);
+    let tp = checkbox(t(lang, K::AlwaysTop), 630, 308, 106, ID_TOP);
     check(tp, cfg.float(edit).topmost);
-    label("(şeffafken arka plan görünmez)", 366, 270, 190);
 
-    label("Bar arka plan", 14, 302, 80);
-    mk(
-        hwnd,
-        "EDIT",
-        &cfg.bar_bg,
-        WS_BORDER,
-        98,
-        300,
-        76,
-        22,
-        ID_BAR_BG,
-        font,
-    );
-    label("Opaklık", 186, 302, 48);
-    num(&cfg.bar_opacity.to_string(), 238, 300, 40, ID_BAR_OPACITY);
-    label("%", 282, 302, 14);
-    let bt = checkbox("Şeffaf bar", 300, 300, 96, ID_BAR_TRANS);
-    check(bt, cfg.bar_transparent);
+    let border = checkbox(t(lang, K::Border), 400, 336, 70, ID_WIDGET_BORDER);
+    check(border, cfg.float(edit).border);
+    label(t(lang, K::HintTransparent), 470, 340, 270);
 
     mk(
         hwnd,
         "BUTTON",
-        "Kaydet",
-        BS_PUSHBUTTON as u32,
-        14,
-        338,
-        84,
-        28,
+        t(lang, K::Save),
+        (BS_PUSHBUTTON as u32) | (BS_OWNERDRAW as u32),
+        520,
+        490,
+        100,
+        34,
         ID_SAVE,
         font,
     );
     mk(
         hwnd,
         "BUTTON",
-        "Kapat",
-        BS_PUSHBUTTON as u32,
-        106,
-        338,
-        84,
-        28,
+        t(lang, K::Close),
+        (BS_PUSHBUTTON as u32) | (BS_OWNERDRAW as u32),
+        630,
+        490,
+        90,
+        34,
         ID_CLOSE,
         font,
     );
-    mk(
-        hwnd,
-        "STATIC",
-        "",
-        0,
-        204,
-        344,
-        330,
-        20,
-        ID_STATUS,
-        font,
-    );
+    mk(hwnd, "STATIC", "", 0, 400, 496, 110, 20, ID_STATUS, font);
+}
+
+unsafe fn color_of(p: &Palette, key: &str) -> [u8; 3] {
+    match key {
+        "label" => p.label,
+        "warn" => p.warn,
+        "cpu" => p.cpu,
+        "ram" => p.ram,
+        "net" => p.net,
+        "disk" => p.disk,
+        "cap" => p.cap,
+        _ => p.text,
+    }
 }
 
 unsafe fn save_from(hwnd: HWND, app: &mut App, edit: Metric) {
     let mut cfg = app.cfg.clone();
     let old = cfg.clone();
+    let lang = old.language;
 
     cfg.refresh_ms = get_int(GetDlgItem(hwnd, ID_REFRESH as i32), old.refresh_ms as i32)
         .clamp(200, 10000) as u32;
@@ -509,10 +570,15 @@ unsafe fn save_from(hwnd: HWND, app: &mut App, edit: Metric) {
         .clamp(8, 48);
     cfg.graph_width = get_int(GetDlgItem(hwnd, ID_GRAPH_W as i32), old.graph_width)
         .clamp(18, 400);
+    cfg.compact = checked(GetDlgItem(hwnd, ID_COMPACT as i32));
 
-    let t = SendMessageW(GetDlgItem(hwnd, ID_THEME as i32), CB_GETCURSEL, 0, 0);
-    if t >= 0 {
-        cfg.theme = Theme::from_index(t as usize);
+    let tsel = SendMessageW(GetDlgItem(hwnd, ID_THEME as i32), CB_GETCURSEL, 0, 0);
+    if tsel >= 0 {
+        cfg.theme = Theme::from_index(tsel as usize);
+    }
+    let lsel = SendMessageW(GetDlgItem(hwnd, ID_LANG as i32), CB_GETCURSEL, 0, 0);
+    if lsel >= 0 {
+        cfg.language = Lang::from_index(lsel as usize);
     }
 
     for (i, m) in Metric::ALL.iter().enumerate() {
@@ -536,7 +602,6 @@ unsafe fn save_from(hwnd: HWND, app: &mut App, edit: Metric) {
         let fc: &mut FloatCfg = cfg.float_mut(*m);
         fc.on = checked(GetDlgItem(hwnd, (ID_FLOAT_BASE + i) as i32));
     }
-    cfg.compact = checked(GetDlgItem(hwnd, ID_COMPACT as i32));
 
     let bar_bg = get_text(GetDlgItem(hwnd, ID_BAR_BG as i32));
     if let Some(c) = parse_color(&bar_bg) {
@@ -547,6 +612,14 @@ unsafe fn save_from(hwnd: HWND, app: &mut App, edit: Metric) {
             .clamp(20, 100) as u8;
     cfg.bar_transparent = checked(GetDlgItem(hwnd, ID_BAR_TRANS as i32));
 
+    for (i, _) in COLOR_KEYS.iter().enumerate() {
+        let h = GetDlgItem(hwnd, (ID_COLOR_BASE + i) as i32);
+        let s = get_text(h);
+        if let Some(c) = parse_color(&s) {
+            cfg.colors.set(COLOR_KEYS[i], hex_color(c));
+        }
+    }
+
     read_widget(hwnd, &mut cfg, edit);
 
     let want_auto = checked(GetDlgItem(hwnd, ID_AUTOSTART as i32));
@@ -555,7 +628,7 @@ unsafe fn save_from(hwnd: HWND, app: &mut App, edit: Metric) {
     }
 
     app.apply_config(cfg);
-    set_text(GetDlgItem(hwnd, ID_STATUS as i32), "Uygulandı");
+    set_text(GetDlgItem(hwnd, ID_STATUS as i32), t(lang, K::Applied));
 }
 
 unsafe fn apply_widget_only(hwnd: HWND, app: &mut App, edit: Metric) {
@@ -581,6 +654,91 @@ unsafe fn apply_bar_only(hwnd: HWND, app: &mut App) {
     crate::apply_bar_style(&*app);
 }
 
+unsafe fn draw_item(dis: &DRAWITEMSTRUCT, ctx: &Ctx) {
+    let id = dis.CtlID as usize;
+    let r = dis.rcItem;
+    let hdc = dis.hDC;
+    let p = ctx.palette;
+    SetBkMode(hdc, 1);
+    if id == ID_SAVE || id == ID_CLOSE || id == ID_RESET_COLORS {
+        let bg = if id == ID_SAVE { p.accent } else { p.surface };
+        let br = CreateSolidBrush(rgb(bg));
+        let rgn = CreateRoundRectRgn(r.left, r.top, r.right + 1, r.bottom + 1, 10, 10);
+        FillRgn(hdc, rgn, br);
+        DeleteObject(rgn);
+        DeleteObject(br);
+        let mut text = [0u16; 128];
+        let n = GetWindowTextW(dis.hwndItem, text.as_mut_ptr(), text.len() as i32);
+        let col = if id == ID_SAVE {
+            [255u8, 255u8, 255u8]
+        } else {
+            p.text
+        };
+        SetTextColor(hdc, rgb(col));
+        let mut rc = r;
+        DrawTextW(
+            hdc,
+            text.as_ptr(),
+            n,
+            &mut rc,
+            0x0001 | 0x0004 | 0x0020,
+        );
+    } else {
+        let on = checked(dis.hwndItem);
+        let size = 16;
+        let bx = r.left + 1;
+        let by = r.top + (r.bottom - r.top - size) / 2;
+        let br = CreateSolidBrush(rgb(if on { p.accent } else { p.surface }));
+        let rgn = CreateRoundRectRgn(bx, by, bx + size + 1, by + size + 1, 6, 6);
+        FillRgn(hdc, rgn, br);
+        DeleteObject(rgn);
+        DeleteObject(br);
+        let edge = CreateSolidBrush(rgb(p.divider));
+        let r1 = RECT {
+            left: bx,
+            top: by,
+            right: bx + size,
+            bottom: by + 1,
+        };
+        FillRect(hdc, &r1, edge);
+        DeleteObject(edge);
+        if on {
+            let pen = create_pen_check(rgb([255, 255, 255]));
+            let old = SelectObject(hdc, pen);
+            let pts = [
+                POINT { x: bx + 4, y: by + 8 },
+                POINT { x: bx + 7, y: by + 11 },
+                POINT { x: bx + 12, y: by + 5 },
+            ];
+            Polyline(hdc, pts.as_ptr(), 3);
+            SelectObject(hdc, old);
+            DeleteObject(pen);
+        }
+        let mut text = [0u16; 128];
+        let n = GetWindowTextW(dis.hwndItem, text.as_mut_ptr(), text.len() as i32);
+        if n > 0 {
+            SetTextColor(hdc, rgb(p.text));
+            let mut rc = RECT {
+                left: r.left + size + 8,
+                top: r.top,
+                right: r.right,
+                bottom: r.bottom,
+            };
+            DrawTextW(
+                hdc,
+                text.as_ptr(),
+                n,
+                &mut rc,
+                0x0004 | 0x0020 | 0x8000,
+            );
+        }
+    }
+}
+
+unsafe fn create_pen_check(color: u32) -> windows_sys::Win32::Graphics::Gdi::HPEN {
+    windows_sys::Win32::Graphics::Gdi::CreatePen(0, 2, color)
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRESULT {
     match msg {
         WM_NCCREATE => {
@@ -591,7 +749,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> L
         WM_CREATE => {
             let ctx = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Ctx;
             if !ctx.is_null() {
-                build_controls(hwnd, &*(*ctx).app, (*ctx).edit);
+                let title = make_font(20, FW_SEMIBOLD);
+                let sect = make_font(16, FW_SEMIBOLD);
+                (*ctx).title_font = title;
+                (*ctx).section_font = sect;
+                build_controls(hwnd, &*(*ctx).app, (*ctx).edit, (title, sect));
                 apply_window_theme(hwnd, &mut *ctx);
                 (*ctx).ready = true;
             }
@@ -610,7 +772,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> L
                         idx,
                         0,
                     );
-                    load_widget(hwnd, (*ctx).app.as_ref().unwrap().cfg.float(m));
+                    if let Some(app) = (*ctx).app.as_ref() {
+                        load_widget(hwnd, app.cfg.float(m));
+                    }
                     (*ctx).loading = false;
                 }
             }
@@ -621,16 +785,117 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> L
             if !ctx.is_null() && !(*ctx).bg_brush.is_null() {
                 let mut rc: RECT = zeroed();
                 GetClientRect(hwnd, &mut rc);
-                FillRect(hdc_cast(w), &rc, (*ctx).bg_brush);
+                FillRect(w as *mut c_void, &rc, (*ctx).bg_brush);
                 return 1;
+            }
+            DefWindowProcW(hwnd, msg, w, l)
+        }
+        WM_PAINT => {
+            let ctx = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Ctx;
+            let mut ps: PAINTSTRUCT = zeroed();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            if !ctx.is_null() {
+                let p = (*ctx).palette;
+                let mut rc: RECT = zeroed();
+                GetClientRect(hwnd, &mut rc);
+                let bg = CreateSolidBrush(rgb(p.bg));
+                FillRect(hdc, &rc, bg);
+                DeleteObject(bg);
+
+                let head = RECT {
+                    left: 0,
+                    top: 0,
+                    right: rc.right,
+                    bottom: HEADER_H,
+                };
+                let hb = CreateSolidBrush(rgb(p.surface));
+                FillRect(hdc, &head, hb);
+                DeleteObject(hb);
+
+                let lang = (*ctx).app.as_ref().map(|a| a.cfg.language).unwrap_or(Lang::En);
+                SetBkMode(hdc, 1);
+                SetTextColor(hdc, rgb(p.text));
+                SelectObject(hdc, (*ctx).title_font);
+                let mut tr = RECT {
+                    left: 24,
+                    top: 0,
+                    right: rc.right - 56,
+                    bottom: HEADER_H,
+                };
+                let title = wide_n(t(lang, K::Title));
+                DrawTextW(
+                    hdc,
+                    title.as_ptr(),
+                    title.len() as i32,
+                    &mut tr,
+                    0x0001 | 0x0004 | 0x0020,
+                );
+
+                SetTextColor(hdc, rgb(p.label));
+                SelectObject(hdc, GetStockObject(17) as HFONT);
+                let close = wide_n("\u{00D7}");
+                let mut cr = RECT {
+                    left: rc.right - 44,
+                    top: 0,
+                    right: rc.right - 8,
+                    bottom: HEADER_H,
+                };
+                DrawTextW(
+                    hdc,
+                    close.as_ptr(),
+                    close.len() as i32,
+                    &mut cr,
+                    0x0001 | 0x0004 | 0x0020,
+                );
+            }
+            EndPaint(hwnd, &mut ps);
+            0
+        }
+        WM_NCHITTEST => {
+            let mut rc: RECT = zeroed();
+            GetClientRect(hwnd, &mut rc);
+            let x = (l & 0xFFFF) as i16 as i32;
+            let y = ((l >> 16) & 0xFFFF) as i16 as i32;
+            let mut pt = POINT { x, y };
+            ScreenToClient(hwnd, &mut pt);
+            if pt.y < HEADER_H {
+                if pt.x > rc.right - 52 {
+                    return HTCLIENT as LRESULT;
+                }
+                return HTCAPTION as LRESULT;
+            }
+            HTCLIENT as LRESULT
+        }
+        WM_LBUTTONUP => {
+            let mut rc: RECT = zeroed();
+            GetClientRect(hwnd, &mut rc);
+            let x = (l & 0xFFFF) as i16 as i32;
+            let y = ((l >> 16) & 0xFFFF) as i16 as i32;
+            if y < HEADER_H && x > rc.right - 52 {
+                DestroyWindow(hwnd);
             }
             0
         }
         WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
             let ctx = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Ctx;
             if !ctx.is_null() {
-                let hdc = hdc_cast(w);
-                SetTextColor(hdc, rgb((*ctx).palette.text));
+                let hdc = w as *mut c_void;
+                let child = l as HWND;
+                let cid = GetDlgCtrlID(child) as usize;
+                let color = if [
+                    ID_SEC_GENERAL,
+                    ID_SEC_BAR,
+                    ID_SEC_COLORS,
+                    ID_SEC_METRICS,
+                    ID_SEC_FLOAT,
+                ]
+                .contains(&cid)
+                {
+                    (*ctx).palette.accent
+                } else {
+                    (*ctx).palette.text
+                };
+                SetTextColor(hdc, rgb(color));
                 SetBkColor(hdc, rgb((*ctx).palette.bg));
                 return (*ctx).bg_brush as LRESULT;
             }
@@ -639,12 +904,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> L
         WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
             let ctx = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Ctx;
             if !ctx.is_null() {
-                let hdc = hdc_cast(w);
+                let hdc = w as *mut c_void;
                 SetTextColor(hdc, rgb((*ctx).palette.text));
                 SetBkColor(hdc, rgb((*ctx).palette.surface));
                 return (*ctx).edit_brush as LRESULT;
             }
             0
+        }
+        WM_DRAWITEM => {
+            let ctx = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Ctx;
+            if !ctx.is_null() {
+                let dis = &*(l as *const DRAWITEMSTRUCT);
+                draw_item(dis, &*ctx);
+            }
+            1
         }
         WM_COMMAND => {
             let id = w & 0xFFFF;
@@ -660,6 +933,33 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> L
                     ID_CLOSE => {
                         DestroyWindow(hwnd);
                     }
+                    ID_RESET_COLORS => {
+                        (*app).cfg.colors = Default::default();
+                        (*app).apply_config((*app).cfg.clone());
+                        let edit = (*ctx).edit;
+                        DestroyWindow(hwnd);
+                        open(app, Some(edit));
+                    }
+                    ID_LANG => {
+                        if code == 1 {
+                            let sel = SendMessageW(
+                                GetDlgItem(hwnd, ID_LANG as i32),
+                                CB_GETCURSEL,
+                                0,
+                                0,
+                            );
+                            if sel >= 0 {
+                                let lang = Lang::from_index(sel as usize);
+                                if lang != (*app).cfg.language {
+                                    (*app).cfg.language = lang;
+                                    (*app).save();
+                                    let edit = (*ctx).edit;
+                                    DestroyWindow(hwnd);
+                                    open(app, Some(edit));
+                                }
+                            }
+                        }
+                    }
                     ID_WIDGET_SEL => {
                         if code == 1 {
                             let sel = SendMessageW(
@@ -671,7 +971,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> L
                             if sel >= 0 {
                                 (*ctx).edit = Metric::ALL[sel as usize];
                                 (*ctx).loading = true;
-                                load_widget(hwnd, (*app).cfg.float((*ctx).edit));
+                                if let Some(a) = (*ctx).app.as_ref() {
+                                    load_widget(hwnd, a.cfg.float((*ctx).edit));
+                                }
                                 (*ctx).loading = false;
                             }
                         }
@@ -697,7 +999,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> L
                             || (ID_SHOW_BASE..ID_SHOW_BASE + 5).contains(&id)
                             || (ID_FLOAT_BASE..ID_FLOAT_BASE + 5).contains(&id)
                             || (ID_MODE_BASE..ID_MODE_BASE + 5).contains(&id)
-                            || (ID_GRAPH_METRIC_BASE..ID_GRAPH_METRIC_BASE + 5).contains(&id);
+                            || (ID_GRAPH_METRIC_BASE..ID_GRAPH_METRIC_BASE + 5).contains(&id)
+                            || (ID_COLOR_BASE..ID_COLOR_BASE + 7).contains(&id);
                         if live {
                             save_from(hwnd, &mut *app, (*ctx).edit);
                             apply_window_theme(hwnd, &mut *ctx);
@@ -724,6 +1027,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> L
                 if !(*ctx).edit_brush.is_null() {
                     DeleteObject((*ctx).edit_brush);
                 }
+                if !(*ctx).title_font.is_null() {
+                    DeleteObject((*ctx).title_font);
+                }
+                if !(*ctx).section_font.is_null() {
+                    DeleteObject((*ctx).section_font);
+                }
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 drop(Box::from_raw(ctx));
             }
@@ -733,6 +1042,3 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> L
     }
 }
 
-fn hdc_cast(w: usize) -> windows_sys::Win32::Graphics::Gdi::HDC {
-    w as *mut c_void as windows_sys::Win32::Graphics::Gdi::HDC
-}

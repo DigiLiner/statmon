@@ -5,6 +5,7 @@ use std::ptr::null_mut;
 
 use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 
+use crate::lang::{t, K, Lang};
 use crate::metrics::Metric;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -29,6 +30,8 @@ pub struct Config {
     pub graphs: GraphMap,
     pub graph_width: i32,
     pub compact: bool,
+    pub language: Lang,
+    pub colors: ColorCfg,
     pub bar_transparent: bool,
     pub bar_bg: String,
     pub bar_opacity: u8,
@@ -58,6 +61,8 @@ impl Default for Config {
             graphs: GraphMap::default(),
             graph_width: 48,
             compact: false,
+            language: Lang::default(),
+            colors: ColorCfg::default(),
             bar_transparent: false,
             bar_bg: "#202020".into(),
             bar_opacity: 80,
@@ -96,6 +101,12 @@ impl Config {
             Metric::Disk => &self.floats.disk,
             Metric::Capacity => &self.floats.capacity,
         }
+    }
+
+    pub fn palette(&self) -> Palette {
+        let mut p = palette(self.theme);
+        self.colors.apply(&mut p);
+        p
     }
 
     pub fn graph_for(&self, m: Metric) -> Graph {
@@ -181,13 +192,16 @@ pub enum Graph {
 impl Graph {
     pub const ALL: [Graph; 4] = [Graph::None, Graph::Bar, Graph::Line, Graph::Pie];
 
-    pub fn label(self) -> &'static str {
-        match self {
-            Graph::None => "Yok",
-            Graph::Bar => "Bar",
-            Graph::Line => "Çizgi",
-            Graph::Pie => "Pasta",
-        }
+    pub fn label_l(self, lang: Lang) -> &'static str {
+        t(
+            lang,
+            match self {
+                Graph::None => K::GraphNone,
+                Graph::Bar => K::GraphBar,
+                Graph::Line => K::GraphLine,
+                Graph::Pie => K::GraphPie,
+            },
+        )
     }
 
     pub fn index(self) -> usize {
@@ -207,12 +221,15 @@ impl Graph {
 impl Theme {
     pub const ALL: [Theme; 3] = [Theme::Auto, Theme::Dark, Theme::Light];
 
-    pub fn label(self) -> &'static str {
-        match self {
-            Theme::Auto => "Otomatik",
-            Theme::Dark => "Koyu",
-            Theme::Light => "Açık",
-        }
+    pub fn label_l(self, lang: Lang) -> &'static str {
+        t(
+            lang,
+            match self {
+                Theme::Auto => K::ThemeAuto,
+                Theme::Dark => K::ThemeDark,
+                Theme::Light => K::ThemeLight,
+            },
+        )
     }
 
     pub fn index(self) -> usize {
@@ -221,6 +238,57 @@ impl Theme {
 
     pub fn from_index(i: usize) -> Theme {
         Theme::ALL.get(i).copied().unwrap_or(Theme::Auto)
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct ColorCfg {
+    pub bg: String,
+    pub label: String,
+    pub accent: String,
+    pub warn: String,
+    pub cpu: String,
+    pub ram: String,
+    pub net: String,
+    pub net_up: String,
+    pub disk: String,
+    pub cap: String,
+}
+
+impl ColorCfg {
+    pub fn apply(&self, p: &mut Palette) {
+        let set = |src: &str, dst: &mut [u8; 3]| {
+            if let Some(c) = parse_color(src) {
+                *dst = c;
+            }
+        };
+        set(&self.bg, &mut p.bg);
+        set(&self.label, &mut p.label);
+        set(&self.accent, &mut p.accent);
+        set(&self.warn, &mut p.warn);
+        set(&self.cpu, &mut p.cpu);
+        set(&self.ram, &mut p.ram);
+        set(&self.net, &mut p.net);
+        set(&self.net_up, &mut p.net_up);
+        set(&self.disk, &mut p.disk);
+        set(&self.cap, &mut p.cap);
+    }
+
+    pub fn set(&mut self, key: &str, value: String) {
+        match key {
+            "bg" => self.bg = value,
+            "label" => self.label = value,
+            "accent" => self.accent = value,
+            "warn" => self.warn = value,
+            "cpu" => self.cpu = value,
+            "ram" => self.ram = value,
+            "net" => self.net = value,
+            "net_up" => self.net_up = value,
+            "disk" => self.disk = value,
+            "cap" => self.cap = value,
+            _ => {}
+        }
     }
 }
 
@@ -245,12 +313,15 @@ pub enum ViewMode {
 impl ViewMode {
     pub const ALL: [ViewMode; 3] = [ViewMode::Text, ViewMode::Graph, ViewMode::Both];
 
-    pub fn label(self) -> &'static str {
-        match self {
-            ViewMode::Text => "Metin",
-            ViewMode::Graph => "Grafik",
-            ViewMode::Both => "Metin+Grafik",
-        }
+    pub fn label_l(self, lang: Lang) -> &'static str {
+        t(
+            lang,
+            match self {
+                ViewMode::Text => K::ViewText,
+                ViewMode::Graph => K::ViewGraph,
+                ViewMode::Both => K::ViewBoth,
+            },
+        )
     }
 
     pub fn index(self) -> usize {

@@ -2,6 +2,7 @@
 
 mod config;
 mod history;
+mod lang;
 mod metrics;
 mod settings;
 mod ui;
@@ -35,6 +36,7 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use config::{Config, Graph, Palette, ViewMode};
+use lang::{t, K};
 use history::History;
 use metrics::{DriveInfo, Metric, Metrics};
 use ui::{Fonts, Frame};
@@ -75,6 +77,8 @@ pub(crate) struct App {
     taskbar_hwnd: HWND,
     pub(crate) settings_hwnd: HWND,
     pub(crate) settings_target: Option<Metric>,
+    taskbar_vertical: bool,
+    taskbar_thickness: i32,
     floats: Vec<(Metric, HWND)>,
     hidden: bool,
     tick: u32,
@@ -161,7 +165,7 @@ unsafe fn run() {
     }
 
     let (cfg, cfg_path) = config::load();
-    let palette = config::palette(cfg.theme);
+    let palette = cfg.palette();
     let app = Box::into_raw(Box::new(App {
         cfg,
         cfg_path,
@@ -176,6 +180,8 @@ unsafe fn run() {
         taskbar_hwnd: null_mut(),
         settings_hwnd: null_mut(),
         settings_target: None,
+        taskbar_vertical: false,
+        taskbar_thickness: 0,
         floats: Vec::new(),
         hidden: false,
         tick: 0,
@@ -370,7 +376,7 @@ impl App {
     pub(crate) unsafe fn apply_config(&mut self, cfg: Config) {
         self.cfg = cfg;
         self.save();
-        self.palette = config::palette(self.cfg.theme);
+        self.palette = self.cfg.palette();
         if let Some(f) = self.fonts.take() {
             f.destroy();
         }
@@ -400,11 +406,28 @@ unsafe fn taskbar_metric_at(hwnd: HWND, ctx: &WinCtx) -> Option<Metric> {
     let mut p: POINT = zeroed();
     GetCursorPos(&mut p);
     ScreenToClient(hwnd, &mut p);
-    let f = frame(app, None, None);
-    ui::tile_at(hwnd, &f, fonts, p.x)
+    let f = frame(
+        app,
+        None,
+        None,
+        app.taskbar_vertical,
+        app.taskbar_thickness,
+    );
+    ui::tile_at(
+        hwnd,
+        &f,
+        fonts,
+        if app.taskbar_vertical { p.y } else { p.x },
+    )
 }
 
-unsafe fn frame<'a>(app: &'a App, metric: Option<Metric>, hover: Option<Metric>) -> Frame<'a> {
+unsafe fn frame<'a>(
+    app: &'a App,
+    metric: Option<Metric>,
+    hover: Option<Metric>,
+    vertical: bool,
+    thickness: i32,
+) -> Frame<'a> {
     Frame {
         metrics: &app.metrics,
         drives: &app.drives,
@@ -414,6 +437,8 @@ unsafe fn frame<'a>(app: &'a App, metric: Option<Metric>, hover: Option<Metric>)
         metric,
         dpi: app.dpi,
         hover,
+        vertical,
+        thickness,
     }
 }
 
@@ -466,7 +491,10 @@ unsafe fn place_taskbar(app: &mut App) {
     mi.cbSize = size_of::<MONITORINFO>() as u32;
     let mon_ok = !mon.is_null() && GetMonitorInfoW(mon, &mut mi) != 0;
 
-    let horizontal = (tb.right - tb.left) >= (tb.bottom - tb.top);
+    let tb_w = tb.right - tb.left;
+    let tb_h = tb.bottom - tb.top;
+    let horizontal = tb_w >= tb_h;
+    let thickness = if horizontal { tb_h } else { tb_w };
     let off_screen = if horizontal {
         mon_ok && (tb.top >= mi.rcMonitor.bottom - 1 || tb.bottom <= mi.rcMonitor.top + 1)
     } else {
@@ -481,31 +509,34 @@ unsafe fn place_taskbar(app: &mut App) {
     let Some(fonts) = app.fonts.as_ref() else {
         return;
     };
-    let f = frame(app, None, None);
-    let width = ui::width(app.taskbar_hwnd, &f, fonts);
-    let th = tb.bottom - tb.top;
-    let height = (th - VPAD * 2).max(16);
 
-    let (x, y) = if horizontal {
+    app.taskbar_vertical = !horizontal;
+    app.taskbar_thickness = thickness;
+
+    let (width, height, x, y) = if horizontal {
+        let f = frame(app, None, None, false, thickness);
+        let width = ui::width(app.taskbar_hwnd, &f, fonts);
+        let height = (thickness - VPAD * 2).max(16);
         let limit = if tray.left > tb.left + 8 && tray.left < tb.right {
             tray.left
         } else {
             tb.right
         };
-        (
-            (limit - width - TASKBAR_GAP).max(tb.left + 4),
-            tb.top + (th - height) / 2,
-        )
+        let x = (limit - width - TASKBAR_GAP).max(tb.left + 4);
+        let y = tb.top + (thickness - height) / 2;
+        (width, height, x, y)
     } else {
+        let f = frame(app, None, None, true, thickness);
+        let width = (thickness - 4).max(30);
+        let height = ui::height_vertical(&f);
         let limit = if tray.top > tb.top + 8 && tray.top < tb.bottom {
             tray.top
         } else {
             tb.bottom
         };
-        (
-            tb.left + ((tb.right - tb.left) - width) / 2,
-            limit - height - TASKBAR_GAP,
-        )
+        let y = (limit - height - TASKBAR_GAP).max(tb.top + 4);
+        let x = tb.left + (thickness - width) / 2;
+        (width, height, x, y)
     };
 
     SetWindowPos(
@@ -532,7 +563,7 @@ unsafe fn update_floats(app: &mut App) {
             let fc = app.cfg.float(m);
             (fc.x, fc.y, fc.topmost)
         };
-        let f = frame(app, Some(m), None);
+        let f = frame(app, Some(m), None, false, 0);
         let width = ui::width(h, &f, fonts);
         let (cx, cy) = clamp_to_work(fx, fy, width, height);
         if cx != fx || cy != fy {
@@ -710,6 +741,7 @@ fn put_tip(nid: &mut NOTIFYICONDATAW, s: &str) {
 
 unsafe fn show_menu(app: *mut App, hwnd: HWND, metric: Option<Metric>) {
     let a = &mut *app;
+    let lang = a.cfg.language;
     let menu = CreatePopupMenu();
 
     let checked = |on: bool| MF_STRING | if on { MF_CHECKED } else { 0 };
@@ -727,7 +759,7 @@ unsafe fn show_menu(app: *mut App, hwnd: HWND, metric: Option<Metric>) {
             menu,
             MF_STRING,
             ID_SETTINGS_FOR_BASE + idx,
-            wide("Bu metrik için ayarlar...").as_ptr(),
+            wide(t(lang, K::ThisMetricSettings)).as_ptr(),
         );
 
         let mm = CreatePopupMenu();
@@ -736,14 +768,14 @@ unsafe fn show_menu(app: *mut App, hwnd: HWND, metric: Option<Metric>) {
                 mm,
                 checked(a.cfg.view(m) == v),
                 ID_METRIC_MODE_BASE + idx * 3 + v.index(),
-                wide(v.label()).as_ptr(),
+                wide(v.label_l(lang)).as_ptr(),
             );
         }
         AppendMenuW(
             menu,
             MF_POPUP,
             mm as usize,
-            wide("Bu metriğin görünümü").as_ptr(),
+            wide(t(lang, K::ThisMetricView)).as_ptr(),
         );
 
         let mg = CreatePopupMenu();
@@ -752,19 +784,19 @@ unsafe fn show_menu(app: *mut App, hwnd: HWND, metric: Option<Metric>) {
                 mg,
                 checked(a.cfg.graph_for(m) == g),
                 ID_METRIC_GRAPH_BASE + idx * 4 + g.index(),
-                wide(g.label()).as_ptr(),
+                wide(g.label_l(lang)).as_ptr(),
             );
         }
         AppendMenuW(
             menu,
             MF_POPUP,
             mg as usize,
-            wide("Bu metriğin grafiği").as_ptr(),
+            wide(t(lang, K::ThisMetricChart)).as_ptr(),
         );
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
     }
 
-    AppendMenuW(menu, MF_STRING, ID_SETTINGS, wide("Ayarlar...").as_ptr());
+    AppendMenuW(menu, MF_STRING, ID_SETTINGS, wide(t(lang, K::Settings)).as_ptr());
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
 
     let gm = CreatePopupMenu();
@@ -773,10 +805,10 @@ unsafe fn show_menu(app: *mut App, hwnd: HWND, metric: Option<Metric>) {
             gm,
             checked(a.cfg.graph == g),
             ID_GRAPH_BASE + g.index(),
-            wide(g.label()).as_ptr(),
+            wide(g.label_l(lang)).as_ptr(),
         );
     }
-    AppendMenuW(menu, MF_POPUP, gm as usize, wide("Grafik türü (tümü)").as_ptr());
+    AppendMenuW(menu, MF_POPUP, gm as usize, wide(t(lang, K::ChartAll)).as_ptr());
 
     let fm = CreatePopupMenu();
     for (i, m) in Metric::ALL.iter().enumerate() {
@@ -796,15 +828,15 @@ unsafe fn show_menu(app: *mut App, hwnd: HWND, metric: Option<Metric>) {
         fm,
         checked(all_trans),
         ID_TRANS,
-        wide("Şeffaf (tümü)").as_ptr(),
+        wide(t(lang, K::TransparentAll)).as_ptr(),
     );
     AppendMenuW(
         fm,
         checked(all_top),
         ID_TOP,
-        wide("Her zaman üstte (tümü)").as_ptr(),
+        wide(t(lang, K::TopmostAll)).as_ptr(),
     );
-    AppendMenuW(menu, MF_POPUP, fm as usize, wide("Yüzen widget").as_ptr());
+    AppendMenuW(menu, MF_POPUP, fm as usize, wide(t(lang, K::Floats)).as_ptr());
 
     let vm = CreatePopupMenu();
     for (i, v) in ViewMode::ALL.iter().enumerate() {
@@ -812,16 +844,16 @@ unsafe fn show_menu(app: *mut App, hwnd: HWND, metric: Option<Metric>) {
             vm,
             MF_STRING,
             ID_VIEW_ALL_BASE + i,
-            wide(v.label()).as_ptr(),
+            wide(v.label_l(lang)).as_ptr(),
         );
     }
-    AppendMenuW(menu, MF_POPUP, vm as usize, wide("Tümü için görünüm").as_ptr());
+    AppendMenuW(menu, MF_POPUP, vm as usize, wide(t(lang, K::ViewAll)).as_ptr());
 
     AppendMenuW(
         menu,
         checked(a.cfg.compact),
         ID_COMPACT,
-        wide("Sıkı yerleşim").as_ptr(),
+        wide(t(lang, K::Compact)).as_ptr(),
     );
 
     if let Some(m) = metric {
@@ -832,21 +864,21 @@ unsafe fn show_menu(app: *mut App, hwnd: HWND, metric: Option<Metric>) {
                 menu,
                 MF_STRING,
                 ID_FLOAT_CLOSE + idx,
-                wide("Bu widget'ı kapat").as_ptr(),
+                wide(t(lang, K::CloseWidget)).as_ptr(),
             );
         }
     }
 
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
-    AppendMenuW(menu, MF_STRING, ID_REFRESH, wide("Yenile").as_ptr());
+    AppendMenuW(menu, MF_STRING, ID_REFRESH, wide(t(lang, K::Refresh)).as_ptr());
     AppendMenuW(
         menu,
         checked(autostart_enabled()),
         ID_AUTOSTART,
-        wide("Başlangıçta çalıştır").as_ptr(),
+        wide(t(lang, K::Autostart)).as_ptr(),
     );
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
-    AppendMenuW(menu, MF_STRING, ID_EXIT, wide("Çıkış").as_ptr());
+    AppendMenuW(menu, MF_STRING, ID_EXIT, wide(t(lang, K::Exit)).as_ptr());
 
     let mut pt: POINT = zeroed();
     GetCursorPos(&mut pt);
@@ -1025,7 +1057,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> L
                     if let Some(fonts) = app.fonts.as_ref() {
                         match ctx.kind {
                             Kind::Taskbar => {
-                                let f = frame(app, None, ctx.hover);
+                                let f = frame(
+                                    app,
+                                    None,
+                                    ctx.hover,
+                                    app.taskbar_vertical,
+                                    app.taskbar_thickness,
+                                );
                                 let look = ui::Look {
                                     transparent: false,
                                     bg: config::parse_color(&app.cfg.bar_bg)
@@ -1036,7 +1074,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> L
                             }
                             Kind::Float(m) => {
                                 let fc = app.cfg.float(m);
-                                let f = frame(app, Some(m), ctx.hover);
+                                let f = frame(app, Some(m), ctx.hover, false, 0);
                                 let edge = if ctx.hover == Some(m) {
                                     Some(app.palette.accent)
                                 } else if fc.border {
@@ -1205,7 +1243,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> L
             let ctx = ctx_ptr(hwnd);
             if let Some(ctx) = ctx.as_ref() {
                 if let Some(app) = ctx.app.as_mut() {
-                    app.palette = config::palette(app.cfg.theme);
+                    app.palette = app.cfg.palette();
                     refresh(app);
                 }
             }

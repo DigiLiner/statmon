@@ -311,7 +311,7 @@ impl Metric {
             Metric::Ram => "RAM",
             Metric::Net => "NET",
             Metric::Disk => "DISK",
-            Metric::Capacity => "DOLU",
+            Metric::Capacity => "CAP",
         }
     }
 
