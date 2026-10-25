@@ -15,17 +15,10 @@ use crate::history::History;
 use crate::metrics::{DriveInfo, Metric, Metrics};
 
 pub const KEY: [u8; 3] = [1, 1, 1];
-const CHART_GAP: i32 = 6;
-
-pub enum Item {
-    Text {
-        text: String,
-        value: bool,
-        color: u32,
-    },
-    Divider,
-    Gap(i32),
-}
+const CHART_GAP: i32 = 5;
+const PART_GAP: i32 = 3;
+const COMPACT_GAP: i32 = 8;
+const HOVER_PAD: i32 = 3;
 
 pub struct Fonts {
     label: HFONT,
@@ -116,8 +109,13 @@ pub fn rgb(c: [u8; 3]) -> u32 {
     (c[0] as u32) | ((c[1] as u32) << 8) | ((c[2] as u32) << 16)
 }
 
+fn blend(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
+    let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t) as u8;
+    [f(a[0], b[0]), f(a[1], b[1]), f(a[2], b[2])]
+}
+
 #[derive(Clone, Copy)]
-pub enum ChartKind {
+enum ChartKind {
     Bar,
     Line,
     Pie,
@@ -130,6 +128,24 @@ pub struct Chart {
     max: f32,
 }
 
+pub struct TextPart {
+    pub text: String,
+    pub color: [u8; 3],
+}
+
+pub struct Tile {
+    pub metric: Metric,
+    pub label: String,
+    pub chart: Option<Chart>,
+    pub parts: Vec<TextPart>,
+}
+
+pub struct Look {
+    pub transparent: bool,
+    pub bg: [u8; 3],
+    pub edge: Option<[u8; 3]>,
+}
+
 pub struct Frame<'a> {
     pub metrics: &'a Metrics,
     pub drives: &'a [DriveInfo],
@@ -137,6 +153,8 @@ pub struct Frame<'a> {
     pub cfg: &'a Config,
     pub palette: &'a Palette,
     pub metric: Option<Metric>,
+    pub dpi: u32,
+    pub hover: Option<Metric>,
 }
 
 impl<'a> Frame<'a> {
@@ -144,112 +162,176 @@ impl<'a> Frame<'a> {
         self.metric.is_some()
     }
 
-    pub fn items(&self) -> Vec<Item> {
-        let mut items = Vec::new();
-        let mut first = true;
-        match self.metric {
-            Some(m) => push_metric(&mut items, m, self, self.palette, None),
-            None => {
-                for m in Metric::ALL {
-                    if self.cfg.shows(m) {
-                        push_metric(&mut items, m, self, self.palette, Some(&mut first));
-                    }
-                }
-            }
-        }
-        items
+    fn compact(&self) -> bool {
+        self.cfg.compact && !self.big()
     }
 
-    pub fn chart(&self) -> Option<Chart> {
-        if self.cfg.graph == Graph::None {
+    fn chart_px(&self) -> i32 {
+        (self.cfg.graph_width * self.dpi.max(96) as i32 / 96).max(12)
+    }
+
+    pub fn tiles(&self) -> Vec<Tile> {
+        let list: Vec<Metric> = match self.metric {
+            Some(m) => vec![m],
+            None => Metric::ALL
+                .into_iter()
+                .filter(|m| self.cfg.shows(*m))
+                .collect(),
+        };
+        let mut tiles = Vec::with_capacity(list.len());
+        for m in list {
+            let mode = self.cfg.view(m);
+            let kind = self.cfg.graph_for(m);
+            let can_graph = mode.has_graph() && kind != Graph::None;
+            let show_text = mode.has_text() || !can_graph;
+            let chart = if can_graph { self.chart_for(m, kind) } else { None };
+            let has_chart = chart.is_some();
+            let label = if m == Metric::Capacity {
+                if has_chart {
+                    if self.compact() {
+                        Metric::Capacity.short().to_string()
+                    } else {
+                        Metric::Capacity.label().to_string()
+                    }
+                } else {
+                    String::new()
+                }
+            } else if self.compact() {
+                m.short().to_string()
+            } else {
+                m.label().to_string()
+            };
+            let parts = if show_text { self.parts_for(m) } else { Vec::new() };
+            tiles.push(Tile {
+                metric: m,
+                label,
+                chart,
+                parts,
+            });
+        }
+        tiles
+    }
+
+    fn chart_for(&self, m: Metric, kind: Graph) -> Option<Chart> {
+        if kind == Graph::None {
             return None;
         }
         let p = self.palette;
         let h = self.history;
-        let m = self.metric;
-        let last = |v: &[f32]| v.last().copied().unwrap_or(0.0);
-
-        let (kind, lines, pie, max) = match self.cfg.graph {
-            Graph::None => return None,
-            Graph::Bar => match m {
-                None => (
-                    ChartKind::Bar,
-                    vec![(h.cpu.clone(), p.cpu)],
-                    vec![],
-                    100.0,
-                ),
-                Some(metric) => (
-                    ChartKind::Bar,
-                    vec![(h.series(metric).to_vec(), metric_color(metric, p))],
-                    vec![],
-                    chart_max(metric, h.series(metric)),
-                ),
-            },
-            Graph::Line => match m {
-                None => (
-                    ChartKind::Line,
-                    vec![(h.cpu.clone(), p.cpu), (h.ram.clone(), p.ram)],
-                    vec![],
-                    100.0,
-                ),
-                Some(metric) => (
-                    ChartKind::Line,
-                    vec![(h.series(metric).to_vec(), metric_color(metric, p))],
-                    vec![],
-                    chart_max(metric, h.series(metric)),
-                ),
-            },
-            Graph::Pie => match m {
-                None => (
-                    ChartKind::Pie,
-                    vec![],
-                    vec![
-                        (last(&h.cpu), p.cpu),
-                        (last(&h.ram), p.ram),
-                        (last(&h.disk), p.disk),
-                    ],
-                    100.0,
-                ),
-                Some(Metric::Net) => (
-                    ChartKind::Pie,
-                    vec![],
-                    vec![
-                        (self.metrics.rx as f32, p.net),
-                        (self.metrics.tx as f32, p.net_up),
-                    ],
-                    100.0,
-                ),
-                Some(metric) => {
-                    let v = last(h.series(metric)).clamp(0.0, 100.0);
-                    (
-                        ChartKind::Pie,
-                        vec![],
-                        vec![(v, metric_color(metric, p)), (100.0 - v, p.divider)],
-                        100.0,
-                    )
+        let data = h.series(m);
+        match kind {
+            Graph::None => None,
+            Graph::Bar => Some(Chart {
+                kind: ChartKind::Bar,
+                lines: vec![(data.to_vec(), metric_color(m, p))],
+                pie: Vec::new(),
+                max: chart_max(m, data),
+            }),
+            Graph::Line => Some(Chart {
+                kind: ChartKind::Line,
+                lines: vec![(data.to_vec(), metric_color(m, p))],
+                pie: Vec::new(),
+                max: chart_max(m, data),
+            }),
+            Graph::Pie => {
+                if m == Metric::Net {
+                    Some(Chart {
+                        kind: ChartKind::Pie,
+                        lines: Vec::new(),
+                        pie: vec![
+                            (self.metrics.rx as f32, p.net),
+                            (self.metrics.tx as f32, p.net_up),
+                        ],
+                        max: 100.0,
+                    })
+                } else {
+                    let v = data.last().copied().unwrap_or(0.0).clamp(0.0, 100.0);
+                    Some(Chart {
+                        kind: ChartKind::Pie,
+                        lines: Vec::new(),
+                        pie: vec![(v, metric_color(m, p)), (100.0 - v, p.divider)],
+                        max: 100.0,
+                    })
                 }
-            },
-        };
-
-        Some(Chart {
-            kind,
-            lines,
-            pie,
-            max,
-        })
+            }
+        }
     }
 
-    pub fn has_chart(&self) -> bool {
-        self.cfg.graph != Graph::None
+    fn parts_for(&self, m: Metric) -> Vec<TextPart> {
+        let p = self.palette;
+        let met = self.metrics;
+        let compact = self.compact();
+        match m {
+            Metric::Cpu => vec![TextPart {
+                text: format!("{:>3}%", met.cpu.round() as i64),
+                color: p.cpu,
+            }],
+            Metric::Ram => vec![TextPart {
+                text: format!("{:>3}%", met.mem_pct),
+                color: p.ram,
+            }],
+            Metric::Net => {
+                if compact {
+                    vec![
+                        TextPart {
+                            text: format!("{:>5}", rate(met.rx)),
+                            color: p.net,
+                        },
+                        TextPart {
+                            text: "/".into(),
+                            color: p.label,
+                        },
+                        TextPart {
+                            text: format!("{:>5}", rate(met.tx)),
+                            color: p.net_up,
+                        },
+                    ]
+                } else {
+                    vec![
+                        TextPart {
+                            text: format!("\u{2193}{:>5}", rate(met.rx)),
+                            color: p.net,
+                        },
+                        TextPart {
+                            text: format!("\u{2191}{:>5}", rate(met.tx)),
+                            color: p.net_up,
+                        },
+                    ]
+                }
+            }
+            Metric::Disk => vec![TextPart {
+                text: format!(
+                    "{:>3}% {:>5}",
+                    met.disk_busy.round() as i64,
+                    rate(met.read_bps + met.write_bps)
+                ),
+                color: p.disk,
+            }],
+            Metric::Capacity => {
+                if self.drives.is_empty() {
+                    return Vec::new();
+                }
+                let warn = self.drives.iter().any(|d| d.used_pct() >= 90.0);
+                vec![TextPart {
+                    text: capacity_text(self.drives, compact),
+                    color: if warn { p.warn } else { p.cap },
+                }]
+            }
+        }
     }
 }
 
 fn chart_max(m: Metric, data: &[f32]) -> f32 {
-    if m == Metric::Net {
-        let top = data.iter().fold(0.0f32, |a, b| a.max(*b));
-        (top * 1.15).max(1024.0)
-    } else {
-        100.0
+    match m {
+        Metric::Net => {
+            let top = data.iter().fold(0.0f32, |a, b| a.max(*b));
+            (top * 1.15).max(1024.0)
+        }
+        Metric::Capacity => 100.0,
+        _ => {
+            let top = data.iter().fold(0.0f32, |a, b| a.max(*b));
+            (top * 1.15).clamp(5.0, 100.0)
+        }
     }
 }
 
@@ -263,95 +345,25 @@ fn metric_color(m: Metric, p: &Palette) -> [u8; 3] {
     }
 }
 
-fn push_metric(
-    items: &mut Vec<Item>,
-    m: Metric,
-    f: &Frame,
-    p: &Palette,
-    first: Option<&mut bool>,
-) {
-    let in_taskbar = first.is_some();
-    if let Some(first) = first {
-        if *first {
-            *first = false;
-        } else {
-            items.push(Item::Gap(f.cfg.divider_gap));
-            items.push(Item::Divider);
-            items.push(Item::Gap(f.cfg.divider_gap));
+fn capacity_text(drives: &[DriveInfo], compact: bool) -> String {
+    let list: &[DriveInfo] = if compact {
+        match drives
+            .iter()
+            .max_by(|a, b| a.used_pct().partial_cmp(&b.used_pct()).unwrap())
+        {
+            Some(d) => std::slice::from_ref(d),
+            None => &[],
         }
-    }
-
-    if m == Metric::Capacity {
-        if f.drives.is_empty() {
-            return;
-        }
-        if in_taskbar {
-            let warn = f.drives.iter().any(|d| d.used_pct() >= 90.0);
-            items.push(Item::Text {
-                text: capacity_text(f.drives),
-                value: true,
-                color: rgb(if warn { p.warn } else { p.cap }),
-            });
-            return;
-        }
-        items.push(Item::Text {
-            text: "DOLU".into(),
-            value: false,
-            color: rgb(p.label),
-        });
-        items.push(Item::Gap(f.cfg.inner_gap));
-        let warn = f.drives.iter().any(|d| d.used_pct() >= 90.0);
-        items.push(Item::Text {
-            text: capacity_text(f.drives),
-            value: true,
-            color: rgb(if warn { p.warn } else { p.cap }),
-        });
-        return;
-    }
-
-    items.push(Item::Text {
-        text: m.label().into(),
-        value: false,
-        color: rgb(p.label),
-    });
-    items.push(Item::Gap(f.cfg.inner_gap));
-
-    let (text, color) = match m {
-        Metric::Cpu => (
-            format!("{:>3}%", f.metrics.cpu.round() as i64),
-            p.cpu,
-        ),
-        Metric::Ram => (format!("{:>3}%", f.metrics.mem_pct), p.ram),
-        Metric::Net => (
-            format!(
-                "↓{:>5} ↑{:>5}",
-                rate(f.metrics.rx),
-                rate(f.metrics.tx)
-            ),
-            p.net,
-        ),
-        Metric::Disk => (
-            format!(
-                "{:>3}% {:>5}",
-                f.metrics.disk_busy.round() as i64,
-                rate(f.metrics.read_bps + f.metrics.write_bps)
-            ),
-            p.disk,
-        ),
-        Metric::Capacity => (String::new(), p.cap),
+    } else {
+        &drives[..drives.len().min(3)]
     };
-
-    items.push(Item::Text {
-        text,
-        value: true,
-        color: rgb(color),
-    });
-}
-
-fn capacity_text(drives: &[DriveInfo]) -> String {
     let mut parts = Vec::new();
-    for d in drives {
-        parts.push(format!("{}:{:>3}%", d.letter, d.used_pct().round() as i64));
+    for d in list {
+        if compact {
+            parts.push(format!("{}:{:>3}%", d.letter, d.used_pct().round() as i64));
+        } else {
+            parts.push(format!("{}:{:>3}%", d.letter, d.used_pct().round() as i64));
+        }
     }
     parts.join("  ")
 }
@@ -389,43 +401,90 @@ fn text_width(hdc: HDC, font: HFONT, s: &str) -> i32 {
     }
 }
 
-fn chart_width(f: &Frame) -> i32 {
-    if f.has_chart() {
-        f.cfg.graph_width.max(16) + CHART_GAP
-    } else {
-        0
+fn tile_width(hdc: HDC, t: &Tile, fonts: &Fonts, big: bool, chart_px: i32) -> i32 {
+    let mut w = 0;
+    let mut first = true;
+    if !t.label.is_empty() {
+        w += text_width(hdc, fonts.label(big), &t.label);
+        first = false;
     }
+    if t.chart.is_some() {
+        if !first {
+            w += CHART_GAP;
+        }
+        w += chart_px;
+        first = false;
+    }
+    let mut prev_glue = false;
+    for part in &t.parts {
+        let glue = part.text == "/";
+        if !first && !glue && !prev_glue {
+            w += PART_GAP;
+        }
+        w += text_width(hdc, fonts.value(big), &part.text);
+        first = false;
+        prev_glue = glue;
+    }
+    w
+}
+
+pub unsafe fn ranges(hwnd: HWND, f: &Frame, fonts: &Fonts) -> Vec<(Metric, i32, i32)> {
+    let hdc = GetDC(hwnd);
+    let big = f.big();
+    let chart_px = f.chart_px();
+    let mut x = f.cfg.pad_x;
+    let mut out = Vec::new();
+    for (i, t) in f.tiles().iter().enumerate() {
+        if i > 0 {
+            x += if f.compact() {
+                COMPACT_GAP
+            } else {
+                f.cfg.divider_gap * 2 + 1
+            };
+        }
+        let start = x;
+        x += tile_width(hdc, t, fonts, big, chart_px);
+        out.push((t.metric, start, x));
+    }
+    ReleaseDC(hwnd, hdc);
+    out
+}
+
+pub unsafe fn tile_at(hwnd: HWND, f: &Frame, fonts: &Fonts, x: i32) -> Option<Metric> {
+    for (m, a, b) in ranges(hwnd, f, fonts) {
+        if x >= a - HOVER_PAD && x <= b + HOVER_PAD {
+            return Some(m);
+        }
+    }
+    None
 }
 
 pub unsafe fn width(hwnd: HWND, f: &Frame, fonts: &Fonts) -> i32 {
     let hdc = GetDC(hwnd);
     let big = f.big();
-    let mut total = 0;
-    for it in f.items() {
-        total += match &it {
-            Item::Text { text, value, .. } => {
-                let font = if *value {
-                    fonts.value(big)
-                } else {
-                    fonts.label(big)
-                };
-                text_width(hdc, font, text)
-            }
-            Item::Divider => 1,
-            Item::Gap(g) => *g,
-        };
+    let chart_px = f.chart_px();
+    let mut total = f.cfg.pad_x * 2;
+    for (i, t) in f.tiles().iter().enumerate() {
+        if i > 0 {
+            total += if f.compact() {
+                COMPACT_GAP
+            } else {
+                f.cfg.divider_gap * 2 + 1
+            };
+        }
+        total += tile_width(hdc, t, fonts, big, chart_px);
     }
     ReleaseDC(hwnd, hdc);
-    total + chart_width(f) + f.cfg.pad_x * 2
+    total
 }
 
-pub unsafe fn paint(hwnd: HWND, f: &Frame, fonts: &Fonts, transparent: bool) {
+pub unsafe fn paint(hwnd: HWND, f: &Frame, fonts: &Fonts, look: &Look) {
     let mut ps: PAINTSTRUCT = zeroed();
     let hdc = BeginPaint(hwnd, &mut ps);
     let mut rc: RECT = zeroed();
     GetClientRect(hwnd, &mut rc);
 
-    let bg = if transparent { KEY } else { f.palette.bg };
+    let bg = if look.transparent { KEY } else { look.bg };
     let bg_br = CreateSolidBrush(rgb(bg));
     FillRect(hdc, &rc, bg_br);
     DeleteObject(bg_br);
@@ -433,38 +492,16 @@ pub unsafe fn paint(hwnd: HWND, f: &Frame, fonts: &Fonts, transparent: bool) {
     SetBkMode(hdc, TRANSPARENT as i32);
     let h = rc.bottom - rc.top;
     let big = f.big();
+    let chart_px = f.chart_px();
     let mut x = f.cfg.pad_x;
+    let tiles = f.tiles();
 
-    if let Some(ch) = f.chart() {
-        let cw = f.cfg.graph_width.max(16);
-        let r = RECT {
-            left: x,
-            top: 3,
-            right: x + cw,
-            bottom: h - 3,
-        };
-        draw_chart(hdc, &r, &ch, f.palette, bg);
-        x += cw + CHART_GAP;
-    }
-
-    for it in f.items() {
-        match it {
-            Item::Text { text, value, color } => {
-                let font = if value {
-                    fonts.value(big)
-                } else {
-                    fonts.label(big)
-                };
-                SelectObject(hdc, font);
-                SetTextColor(hdc, color);
-                let w = text.encode_utf16().collect::<Vec<u16>>();
-                let mut sz: SIZE = zeroed();
-                GetTextExtentPoint32W(hdc, w.as_ptr(), w.len() as i32, &mut sz);
-                let y = (h - sz.cy) / 2;
-                TextOutW(hdc, x, y, w.as_ptr(), w.len() as i32);
-                x += sz.cx;
-            }
-            Item::Divider => {
+    for (i, t) in tiles.iter().enumerate() {
+        if i > 0 {
+            if f.compact() {
+                x += COMPACT_GAP;
+            } else {
+                x += f.cfg.divider_gap;
                 let br = CreateSolidBrush(rgb(f.palette.divider));
                 let r = RECT {
                     left: x,
@@ -474,13 +511,117 @@ pub unsafe fn paint(hwnd: HWND, f: &Frame, fonts: &Fonts, transparent: bool) {
                 };
                 FillRect(hdc, &r, br);
                 DeleteObject(br);
-                x += 1;
+                x += 1 + f.cfg.divider_gap;
             }
-            Item::Gap(g) => x += g,
         }
+
+        let start = x;
+        let tw = tile_width(hdc, t, fonts, big, chart_px);
+
+        if f.hover == Some(t.metric) {
+            let hl = blend(bg, f.palette.accent, 0.22);
+            let br = CreateSolidBrush(rgb(hl));
+            let r = RECT {
+                left: (start - HOVER_PAD).max(0),
+                top: 2,
+                right: start + tw + HOVER_PAD,
+                bottom: h - 2,
+            };
+            FillRect(hdc, &r, br);
+            DeleteObject(br);
+            let ab = CreateSolidBrush(rgb(f.palette.accent));
+            let r = RECT {
+                left: (start - HOVER_PAD).max(0),
+                top: h - 3,
+                right: start + tw + HOVER_PAD,
+                bottom: h - 1,
+            };
+            FillRect(hdc, &r, ab);
+            DeleteObject(ab);
+        }
+
+        let mut first = true;
+
+        if !t.label.is_empty() {
+            draw_text(hdc, x, h, &t.label, fonts.label(big), rgb(f.palette.label));
+            x += text_width(hdc, fonts.label(big), &t.label);
+            first = false;
+        }
+
+        if let Some(ch) = &t.chart {
+            if !first {
+                x += CHART_GAP;
+            }
+            let r = RECT {
+                left: x,
+                top: 3,
+                right: x + chart_px,
+                bottom: h - 3,
+            };
+            draw_chart(hdc, &r, ch, f.palette, bg);
+            x += chart_px;
+            first = false;
+        }
+
+        let mut prev_glue = false;
+        for part in &t.parts {
+            let glue = part.text == "/";
+            if !first && !glue && !prev_glue {
+                x += PART_GAP;
+            }
+            draw_text(hdc, x, h, &part.text, fonts.value(big), rgb(part.color));
+            x += text_width(hdc, fonts.value(big), &part.text);
+            first = false;
+            prev_glue = glue;
+        }
+        x = start + tw;
+    }
+
+    if let Some(edge) = look.edge {
+        let br = CreateSolidBrush(rgb(edge));
+        let strips = [
+            RECT {
+                left: rc.left,
+                top: rc.top,
+                right: rc.right,
+                bottom: rc.top + 1,
+            },
+            RECT {
+                left: rc.left,
+                top: rc.bottom - 1,
+                right: rc.right,
+                bottom: rc.bottom,
+            },
+            RECT {
+                left: rc.left,
+                top: rc.top,
+                right: rc.left + 1,
+                bottom: rc.bottom,
+            },
+            RECT {
+                left: rc.right - 1,
+                top: rc.top,
+                right: rc.right,
+                bottom: rc.bottom,
+            },
+        ];
+        for strip in &strips {
+            FillRect(hdc, strip, br);
+        }
+        DeleteObject(br);
     }
 
     EndPaint(hwnd, &mut ps);
+}
+
+unsafe fn draw_text(hdc: HDC, x: i32, h: i32, s: &str, font: HFONT, color: u32) {
+    SelectObject(hdc, font);
+    SetTextColor(hdc, color);
+    let w = s.encode_utf16().collect::<Vec<u16>>();
+    let mut sz: SIZE = zeroed();
+    GetTextExtentPoint32W(hdc, w.as_ptr(), w.len() as i32, &mut sz);
+    let y = (h - sz.cy) / 2;
+    TextOutW(hdc, x, y, w.as_ptr(), w.len() as i32);
 }
 
 unsafe fn draw_chart(hdc: HDC, r: &RECT, ch: &Chart, p: &Palette, bg: [u8; 3]) {
@@ -557,22 +698,22 @@ unsafe fn draw_chart(hdc: HDC, r: &RECT, ch: &Chart, p: &Palette, bg: [u8; 3]) {
                 SelectObject(hdc, old_br);
                 DeleteObject(br);
             } else {
-                let mut start = -90.0f32;
+                let mut start = 0.0f32;
                 for (v, color) in &ch.pie {
                     let sweep = (v.max(0.0) / total) * 360.0;
-                    if sweep < 0.4 {
+                    if sweep < 3.0 {
                         start += sweep;
                         continue;
                     }
                     let a0 = start.to_radians();
                     let a1 = (start + sweep).to_radians();
-                    let x1 = cx + (rad as f32 * a0.cos()) as i32;
-                    let y1 = cy + (rad as f32 * a0.sin()) as i32;
-                    let x2 = cx + (rad as f32 * a1.cos()) as i32;
-                    let y2 = cy + (rad as f32 * a1.sin()) as i32;
+                    let x1 = cx + (rad as f32 * a0.sin()) as i32;
+                    let y1 = cy - (rad as f32 * a0.cos()) as i32;
+                    let x2 = cx + (rad as f32 * a1.sin()) as i32;
+                    let y2 = cy - (rad as f32 * a1.cos()) as i32;
                     let br = CreateSolidBrush(rgb(*color));
                     let old_br = SelectObject(hdc, br);
-                    Pie(hdc, cx - rad, cy - rad, cx + rad, cy + rad, x1, y1, x2, y2);
+                    Pie(hdc, cx - rad, cy - rad, cx + rad, cy + rad, x2, y2, x1, y1);
                     SelectObject(hdc, old_br);
                     DeleteObject(br);
                     start += sweep;

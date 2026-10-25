@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, InvalidateRect, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    GetMonitorInfoW, InvalidateRect, MonitorFromPoint, MonitorFromWindow, ScreenToClient,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Registry::{
@@ -24,14 +25,16 @@ use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+};
 use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
     NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use config::{Config, Graph, Palette};
+use config::{Config, Graph, Palette, ViewMode};
 use history::History;
 use metrics::{DriveInfo, Metric, Metrics};
 use ui::{Fonts, Frame};
@@ -48,6 +51,11 @@ const ID_GRAPH_BASE: usize = 110;
 const ID_FLOAT_BASE: usize = 120;
 const ID_TRANS: usize = 130;
 const ID_TOP: usize = 131;
+const ID_COMPACT: usize = 132;
+const ID_VIEW_ALL_BASE: usize = 140;
+const ID_METRIC_MODE_BASE: usize = 500;
+const ID_METRIC_GRAPH_BASE: usize = 520;
+const ID_SETTINGS_FOR_BASE: usize = 560;
 const ID_FLOAT_CLOSE: usize = 300;
 
 const VPAD: i32 = 6;
@@ -66,6 +74,7 @@ pub(crate) struct App {
     taskbar_msg: u32,
     taskbar_hwnd: HWND,
     pub(crate) settings_hwnd: HWND,
+    pub(crate) settings_target: Option<Metric>,
     floats: Vec<(Metric, HWND)>,
     hidden: bool,
     tick: u32,
@@ -86,6 +95,8 @@ struct WinCtx {
     app: *mut App,
     kind: Kind,
     drag: Option<Drag>,
+    hover: Option<Metric>,
+    tracking: bool,
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -164,6 +175,7 @@ unsafe fn run() {
         taskbar_msg: RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()),
         taskbar_hwnd: null_mut(),
         settings_hwnd: null_mut(),
+        settings_target: None,
         floats: Vec::new(),
         hidden: false,
         tick: 0,
@@ -200,13 +212,23 @@ unsafe fn register_widget_class() {
         cbClsExtra: 0,
         cbWndExtra: 0,
         hInstance: hinst,
-        hIcon: LoadIconW(null_mut(), IDI_APPLICATION),
+        hIcon: app_icon(),
         hCursor: LoadCursorW(null_mut(), IDC_ARROW),
         hbrBackground: null_mut(),
         lpszMenuName: null(),
         lpszClassName: cls.as_ptr(),
     };
     RegisterClassW(&wc);
+}
+
+pub(crate) unsafe fn app_icon() -> HICON {
+    let hinst = GetModuleHandleW(null());
+    let icon = LoadIconW(hinst, 1 as *const u16);
+    if icon.is_null() {
+        LoadIconW(null_mut(), IDI_APPLICATION)
+    } else {
+        icon
+    }
 }
 
 unsafe fn create_widget(
@@ -223,15 +245,24 @@ unsafe fn create_widget(
         app,
         kind,
         drag: None,
+        hover: None,
+        tracking: false,
     }));
     let mut ex = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
     match kind {
-        Kind::Taskbar => ex |= WS_EX_TOPMOST,
-        Kind::Float(_) => {
-            if (*app).cfg.float_topmost {
+        Kind::Taskbar => {
+            ex |= WS_EX_TOPMOST;
+            let cfg = &(*app).cfg;
+            if cfg.bar_transparent {
+                ex |= WS_EX_LAYERED;
+            }
+        }
+        Kind::Float(m) => {
+            let fc = (*app).cfg.float(m);
+            if fc.topmost {
                 ex |= WS_EX_TOPMOST;
             }
-            if (*app).cfg.float_transparent {
+            if fc.transparent || fc.opacity < 100 {
                 ex |= WS_EX_LAYERED;
             }
         }
@@ -254,12 +285,74 @@ unsafe fn create_widget(
         drop(Box::from_raw(ctx));
         return hwnd;
     }
-    if let Kind::Float(_) = kind {
-        if (*app).cfg.float_transparent {
-            SetLayeredWindowAttributes(hwnd, ui::rgb(ui::KEY), 0, LWA_COLORKEY);
+    match kind {
+        Kind::Taskbar => {
+            let cfg = &(*app).cfg;
+            apply_style(
+                hwnd,
+                false,
+                if cfg.bar_transparent {
+                    cfg.bar_opacity.max(30)
+                } else {
+                    100
+                },
+                true,
+            );
+        }
+        Kind::Float(m) => {
+            let fc = (*app).cfg.float(m);
+            apply_style(hwnd, fc.transparent, fc.opacity, fc.topmost);
         }
     }
     hwnd
+}
+
+unsafe fn apply_style(hwnd: HWND, transparent: bool, opacity: u8, topmost: bool) {
+    let mut ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as usize;
+    ex &= !(WS_EX_LAYERED as usize);
+    let alpha = ((opacity.clamp(0, 100) as u32 * 255 + 50) / 100) as u8;
+    let layered = transparent || alpha < 255;
+    if layered {
+        ex |= WS_EX_LAYERED as usize;
+    }
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex as isize);
+    if layered {
+        let mut flags = 0;
+        if transparent {
+            flags |= LWA_COLORKEY;
+        }
+        if alpha < 255 {
+            flags |= LWA_ALPHA;
+        }
+        let key = if transparent { ui::rgb(ui::KEY) } else { 0 };
+        SetLayeredWindowAttributes(hwnd, key, alpha, flags);
+    }
+    SetWindowPos(
+        hwnd,
+        if topmost { HWND_TOPMOST } else { HWND_NOTOPMOST },
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+    );
+}
+
+pub(crate) unsafe fn apply_bar_style(app: &App) {
+    if app.taskbar_hwnd.is_null() {
+        return;
+    }
+    apply_style(
+        app.taskbar_hwnd,
+        false,
+        if app.cfg.bar_transparent {
+            app.cfg.bar_opacity.max(30)
+        } else {
+            100
+        },
+        true,
+    );
+    InvalidateRect(app.taskbar_hwnd, null(), 0);
 }
 
 impl App {
@@ -282,8 +375,8 @@ impl App {
             f.destroy();
         }
         self.dpi = 0;
-        self.hidden = false;
         sync_floats(self);
+        apply_bar_style(self);
         SetTimer(self.taskbar_hwnd, TIMER_ID, self.cfg.refresh_ms, None);
         refresh(self);
     }
@@ -292,9 +385,26 @@ impl App {
         self.cfg.float_mut(m).on = on;
         self.save();
     }
+
+    pub(crate) unsafe fn restyle(&mut self) {
+        for m in Metric::ALL {
+            apply_float_style(self, m);
+        }
+        self.save();
+    }
 }
 
-unsafe fn frame<'a>(app: &'a App, metric: Option<Metric>) -> Frame<'a> {
+unsafe fn taskbar_metric_at(hwnd: HWND, ctx: &WinCtx) -> Option<Metric> {
+    let app = ctx.app.as_ref()?;
+    let fonts = app.fonts.as_ref()?;
+    let mut p: POINT = zeroed();
+    GetCursorPos(&mut p);
+    ScreenToClient(hwnd, &mut p);
+    let f = frame(app, None, None);
+    ui::tile_at(hwnd, &f, fonts, p.x)
+}
+
+unsafe fn frame<'a>(app: &'a App, metric: Option<Metric>, hover: Option<Metric>) -> Frame<'a> {
     Frame {
         metrics: &app.metrics,
         drives: &app.drives,
@@ -302,6 +412,8 @@ unsafe fn frame<'a>(app: &'a App, metric: Option<Metric>) -> Frame<'a> {
         cfg: &app.cfg,
         palette: &app.palette,
         metric,
+        dpi: app.dpi,
+        hover,
     }
 }
 
@@ -369,7 +481,7 @@ unsafe fn place_taskbar(app: &mut App) {
     let Some(fonts) = app.fonts.as_ref() else {
         return;
     };
-    let f = frame(app, None);
+    let f = frame(app, None, None);
     let width = ui::width(app.taskbar_hwnd, &f, fonts);
     let th = tb.bottom - tb.top;
     let height = (th - VPAD * 2).max(16);
@@ -416,10 +528,19 @@ unsafe fn update_floats(app: &mut App) {
     let height = ((app.cfg.float_font_px * dpi / 96) * 2 + 10).max(22);
     for i in 0..app.floats.len() {
         let (m, h) = app.floats[i];
-        let fc = app.cfg.float(m);
-        let f = frame(app, Some(m));
+        let (fx, fy, topmost) = {
+            let fc = app.cfg.float(m);
+            (fc.x, fc.y, fc.topmost)
+        };
+        let f = frame(app, Some(m), None);
         let width = ui::width(h, &f, fonts);
-        let level = if app.cfg.float_topmost {
+        let (cx, cy) = clamp_to_work(fx, fy, width, height);
+        if cx != fx || cy != fy {
+            let fc = app.cfg.float_mut(m);
+            fc.x = cx;
+            fc.y = cy;
+        }
+        let level = if topmost {
             HWND_TOPMOST
         } else {
             HWND_NOTOPMOST
@@ -427,14 +548,27 @@ unsafe fn update_floats(app: &mut App) {
         SetWindowPos(
             h,
             level,
-            fc.x,
-            fc.y,
+            cx,
+            cy,
             width,
             height,
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
         InvalidateRect(h, null(), 0);
     }
+}
+
+unsafe fn clamp_to_work(x: i32, y: i32, w: i32, h: i32) -> (i32, i32) {
+    let mon = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+    let mut mi: MONITORINFO = zeroed();
+    mi.cbSize = size_of::<MONITORINFO>() as u32;
+    if mon.is_null() || GetMonitorInfoW(mon, &mut mi) == 0 {
+        return (x, y);
+    }
+    let wr = mi.rcWork;
+    let max_x = (wr.right - w).max(wr.left);
+    let max_y = (wr.bottom - h).max(wr.top);
+    (x.clamp(wr.left, max_x), y.clamp(wr.top, max_y))
 }
 
 unsafe fn set_hidden(app: &mut App, hidden: bool) {
@@ -478,29 +612,9 @@ unsafe fn apply_float_style(app: &mut App, m: Metric) {
     let Some(h) = app.float_hwnd(m) else {
         return;
     };
-    let mut ex = GetWindowLongPtrW(h, GWL_EXSTYLE) as usize;
-    ex &= !(WS_EX_LAYERED as usize);
-    if app.cfg.float_transparent {
-        ex |= WS_EX_LAYERED as usize;
-    }
-    SetWindowLongPtrW(h, GWL_EXSTYLE, ex as isize);
-    if app.cfg.float_transparent {
-        SetLayeredWindowAttributes(h, ui::rgb(ui::KEY), 0, LWA_COLORKEY);
-    }
-    let level = if app.cfg.float_topmost {
-        HWND_TOPMOST
-    } else {
-        HWND_NOTOPMOST
-    };
-    SetWindowPos(
-        h,
-        level,
-        0,
-        0,
-        0,
-        0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-    );
+    let fc = app.cfg.float(m).clone();
+    apply_style(h, fc.transparent, fc.opacity, fc.topmost);
+    InvalidateRect(h, null(), 0);
 }
 
 unsafe fn taskbar_rects() -> Option<(RECT, RECT)> {
@@ -557,7 +671,7 @@ unsafe fn tray_add(hwnd: HWND) {
     nid.uID = TRAY_ID;
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = WM_TRAY;
-    nid.hIcon = LoadIconW(null_mut(), IDI_APPLICATION);
+    nid.hIcon = app_icon();
     put_tip(&mut nid, "StatMon");
     Shell_NotifyIconW(NIM_ADD, &nid);
 }
@@ -572,7 +686,7 @@ unsafe fn tray_tip(hwnd: HWND, m: &Metrics) {
     nid.uID = TRAY_ID;
     nid.uFlags = NIF_TIP;
     let tip = format!(
-        "CPU {:.0}%  RAM {}% ({:.1}/{:.1} GB)\nNET ↓{}  ↑{}\nDISK {:.0}%  {}",
+        "CPU {:.0}%  RAM {}% ({:.1}/{:.1} GB)\nNET \u{2193}{}  \u{2191}{}\nDISK {:.0}%  {}",
         m.cpu,
         m.mem_pct,
         m.mem_used as f64 / 1073741824.0,
@@ -598,7 +712,57 @@ unsafe fn show_menu(app: *mut App, hwnd: HWND, metric: Option<Metric>) {
     let a = &mut *app;
     let menu = CreatePopupMenu();
 
-    let mut checked = |on: bool| MF_STRING | if on { MF_CHECKED } else { 0 };
+    let checked = |on: bool| MF_STRING | if on { MF_CHECKED } else { 0 };
+
+    if let Some(m) = metric {
+        AppendMenuW(
+            menu,
+            MF_STRING | MF_DISABLED | MF_GRAYED,
+            0,
+            wide(m.label()).as_ptr(),
+        );
+        AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        let idx = Metric::ALL.iter().position(|x| *x == m).unwrap_or(0);
+        AppendMenuW(
+            menu,
+            MF_STRING,
+            ID_SETTINGS_FOR_BASE + idx,
+            wide("Bu metrik için ayarlar...").as_ptr(),
+        );
+
+        let mm = CreatePopupMenu();
+        for v in ViewMode::ALL {
+            AppendMenuW(
+                mm,
+                checked(a.cfg.view(m) == v),
+                ID_METRIC_MODE_BASE + idx * 3 + v.index(),
+                wide(v.label()).as_ptr(),
+            );
+        }
+        AppendMenuW(
+            menu,
+            MF_POPUP,
+            mm as usize,
+            wide("Bu metriğin görünümü").as_ptr(),
+        );
+
+        let mg = CreatePopupMenu();
+        for g in Graph::ALL {
+            AppendMenuW(
+                mg,
+                checked(a.cfg.graph_for(m) == g),
+                ID_METRIC_GRAPH_BASE + idx * 4 + g.index(),
+                wide(g.label()).as_ptr(),
+            );
+        }
+        AppendMenuW(
+            menu,
+            MF_POPUP,
+            mg as usize,
+            wide("Bu metriğin grafiği").as_ptr(),
+        );
+        AppendMenuW(menu, MF_SEPARATOR, 0, null());
+    }
 
     AppendMenuW(menu, MF_STRING, ID_SETTINGS, wide("Ayarlar...").as_ptr());
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
@@ -612,7 +776,7 @@ unsafe fn show_menu(app: *mut App, hwnd: HWND, metric: Option<Metric>) {
             wide(g.label()).as_ptr(),
         );
     }
-    AppendMenuW(menu, MF_POPUP, gm as usize, wide("Grafik").as_ptr());
+    AppendMenuW(menu, MF_POPUP, gm as usize, wide("Grafik türü (tümü)").as_ptr());
 
     let fm = CreatePopupMenu();
     for (i, m) in Metric::ALL.iter().enumerate() {
@@ -624,29 +788,53 @@ unsafe fn show_menu(app: *mut App, hwnd: HWND, metric: Option<Metric>) {
         );
     }
     AppendMenuW(fm, MF_SEPARATOR, 0, null());
+    let all_trans = Metric::ALL
+        .iter()
+        .all(|m| a.cfg.float(*m).transparent);
+    let all_top = Metric::ALL.iter().all(|m| a.cfg.float(*m).topmost);
     AppendMenuW(
         fm,
-        checked(a.cfg.float_transparent),
+        checked(all_trans),
         ID_TRANS,
-        wide("Şeffaf").as_ptr(),
+        wide("Şeffaf (tümü)").as_ptr(),
     );
     AppendMenuW(
         fm,
-        checked(a.cfg.float_topmost),
+        checked(all_top),
         ID_TOP,
-        wide("Her zaman üstte").as_ptr(),
+        wide("Her zaman üstte (tümü)").as_ptr(),
     );
     AppendMenuW(menu, MF_POPUP, fm as usize, wide("Yüzen widget").as_ptr());
+
+    let vm = CreatePopupMenu();
+    for (i, v) in ViewMode::ALL.iter().enumerate() {
+        AppendMenuW(
+            vm,
+            MF_STRING,
+            ID_VIEW_ALL_BASE + i,
+            wide(v.label()).as_ptr(),
+        );
+    }
+    AppendMenuW(menu, MF_POPUP, vm as usize, wide("Tümü için görünüm").as_ptr());
+
+    AppendMenuW(
+        menu,
+        checked(a.cfg.compact),
+        ID_COMPACT,
+        wide("Sıkı yerleşim").as_ptr(),
+    );
 
     if let Some(m) = metric {
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
         let idx = Metric::ALL.iter().position(|x| *x == m).unwrap_or(0);
-        AppendMenuW(
-            menu,
-            MF_STRING,
-            ID_FLOAT_CLOSE + idx,
-            wide("Bu widget'ı kapat").as_ptr(),
-        );
+        if a.cfg.float(m).on {
+            AppendMenuW(
+                menu,
+                MF_STRING,
+                ID_FLOAT_CLOSE + idx,
+                wide("Bu widget'ı kapat").as_ptr(),
+            );
+        }
     }
 
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
@@ -678,7 +866,31 @@ unsafe fn show_menu(app: *mut App, hwnd: HWND, metric: Option<Metric>) {
 
 unsafe fn on_command(app: *mut App, id: usize) {
     if id == ID_SETTINGS {
-        settings::open(app);
+        settings::open(app, None);
+        return;
+    }
+    if (ID_SETTINGS_FOR_BASE..ID_SETTINGS_FOR_BASE + 5).contains(&id) {
+        settings::open(app, Some(Metric::ALL[id - ID_SETTINGS_FOR_BASE]));
+        return;
+    }
+    if (ID_METRIC_MODE_BASE..ID_METRIC_MODE_BASE + 15).contains(&id) {
+        let rel = id - ID_METRIC_MODE_BASE;
+        let idx = rel / 3;
+        let mode = ViewMode::from_index(rel % 3);
+        let a = &mut *app;
+        *a.cfg.view_mut(Metric::ALL[idx]) = mode;
+        a.save();
+        refresh(a);
+        return;
+    }
+    if (ID_METRIC_GRAPH_BASE..ID_METRIC_GRAPH_BASE + 20).contains(&id) {
+        let rel = id - ID_METRIC_GRAPH_BASE;
+        let idx = rel / 4;
+        let g = Graph::from_index(rel % 4);
+        let a = &mut *app;
+        a.cfg.set_graph_for(Metric::ALL[idx], g);
+        a.save();
+        refresh(a);
         return;
     }
     let a = &mut *app;
@@ -696,21 +908,42 @@ unsafe fn on_command(app: *mut App, id: usize) {
         return;
     }
     if id == ID_TRANS {
-        a.cfg.float_transparent = !a.cfg.float_transparent;
+        let on = !Metric::ALL.iter().all(|m| a.cfg.float(*m).transparent);
+        for m in Metric::ALL {
+            a.cfg.float_mut(m).transparent = on;
+        }
         a.save();
         sync_floats(a);
         refresh(a);
         return;
     }
     if id == ID_TOP {
-        a.cfg.float_topmost = !a.cfg.float_topmost;
+        let on = !Metric::ALL.iter().all(|m| a.cfg.float(*m).topmost);
+        for m in Metric::ALL {
+            a.cfg.float_mut(m).topmost = on;
+        }
         a.save();
         sync_floats(a);
         refresh(a);
         return;
     }
+    if (ID_VIEW_ALL_BASE..ID_VIEW_ALL_BASE + 3).contains(&id) {
+        let mode = ViewMode::from_index(id - ID_VIEW_ALL_BASE);
+        for m in Metric::ALL {
+            *a.cfg.view_mut(m) = mode;
+        }
+        a.save();
+        refresh(a);
+        return;
+    }
+    if id == ID_COMPACT {
+        a.cfg.compact = !a.cfg.compact;
+        a.save();
+        refresh(a);
+        return;
+    }
     if (ID_GRAPH_BASE..ID_GRAPH_BASE + 4).contains(&id) {
-        a.cfg.graph = Graph::from_index(id - ID_GRAPH_BASE);
+        a.cfg.set_graph_all(Graph::from_index(id - ID_GRAPH_BASE));
         a.save();
         refresh(a);
         return;
@@ -732,21 +965,17 @@ unsafe fn on_command(app: *mut App, id: usize) {
 
 unsafe fn quit(app: &mut App) {
     if !app.settings_hwnd.is_null() {
-        DestroyWindow(app.settings_hwnd);
-        app.settings_hwnd = null_mut();
+        PostMessageW(app.settings_hwnd, WM_CLOSE, 0, 0);
     }
-    let list: Vec<HWND> = app.floats.drain(..).map(|(_, h)| h).collect();
-    for h in list {
-        DestroyWindow(h);
+    for (_, h) in &app.floats {
+        PostMessageW(*h, WM_CLOSE, 0, 0);
     }
-    let tb = app.taskbar_hwnd;
-    app.taskbar_hwnd = null_mut();
-    if !tb.is_null() {
-        DestroyWindow(tb);
+    if !app.taskbar_hwnd.is_null() {
+        PostMessageW(app.taskbar_hwnd, WM_CLOSE, 0, 0);
     }
 }
 
-unsafe fn autostart_enabled() -> bool {
+pub(crate) unsafe fn autostart_enabled() -> bool {
     let sub = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
     let name = wide("StatMon");
     let mut data = [0u16; 512];
@@ -762,7 +991,7 @@ unsafe fn autostart_enabled() -> bool {
     ) == 0
 }
 
-unsafe fn set_autostart(on: bool) {
+pub(crate) unsafe fn set_autostart(on: bool) {
     let sub = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
     let name = wide("StatMon");
     if on {
@@ -796,12 +1025,34 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> L
                     if let Some(fonts) = app.fonts.as_ref() {
                         match ctx.kind {
                             Kind::Taskbar => {
-                                let f = frame(app, None);
-                                ui::paint(hwnd, &f, fonts, false);
+                                let f = frame(app, None, ctx.hover);
+                                let look = ui::Look {
+                                    transparent: false,
+                                    bg: config::parse_color(&app.cfg.bar_bg)
+                                        .unwrap_or(app.palette.bg),
+                                    edge: None,
+                                };
+                                ui::paint(hwnd, &f, fonts, &look);
                             }
                             Kind::Float(m) => {
-                                let f = frame(app, Some(m));
-                                ui::paint(hwnd, &f, fonts, app.cfg.float_transparent);
+                                let fc = app.cfg.float(m);
+                                let f = frame(app, Some(m), ctx.hover);
+                                let edge = if ctx.hover == Some(m) {
+                                    Some(app.palette.accent)
+                                } else if fc.border {
+                                    Some(
+                                        config::parse_color(&fc.border_color)
+                                            .unwrap_or(app.palette.divider),
+                                    )
+                                } else {
+                                    None
+                                };
+                                let look = ui::Look {
+                                    transparent: fc.transparent,
+                                    bg: config::parse_color(&fc.bg).unwrap_or(app.palette.bg),
+                                    edge,
+                                };
+                                ui::paint(hwnd, &f, fonts, &look);
                             }
                         }
                     }
@@ -820,13 +1071,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> L
             }
             0
         }
+        WM_COMMAND => {
+            let ctx = ctx_ptr(hwnd);
+            if let Some(ctx) = ctx.as_ref() {
+                on_command(ctx.app, w & 0xFFFF);
+            }
+            0
+        }
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
         WM_RBUTTONUP | WM_CONTEXTMENU => {
             let ctx = ctx_ptr(hwnd);
             if let Some(ctx) = ctx.as_ref() {
                 let metric = match ctx.kind {
                     Kind::Float(m) => Some(m),
-                    _ => None,
+                    Kind::Taskbar => taskbar_metric_at(hwnd, ctx),
                 };
                 show_menu(ctx.app, hwnd, metric);
             }
@@ -858,17 +1116,51 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> L
                 if let Some(d) = &ctx.drag {
                     let mut p: POINT = zeroed();
                     GetCursorPos(&mut p);
-                    let dx = p.x - d.start.x;
-                    let dy = p.y - d.start.y;
+                    let nx = d.origin.x + (p.x - d.start.x);
+                    let ny = d.origin.y + (p.y - d.start.y);
                     SetWindowPos(
                         hwnd,
                         null_mut(),
-                        d.origin.x + dx,
-                        d.origin.y + dy,
+                        nx,
+                        ny,
                         0,
                         0,
                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
                     );
+                    if let Kind::Float(m) = ctx.kind {
+                        if let Some(app) = ctx.app.as_mut() {
+                            let fc = app.cfg.float_mut(m);
+                            fc.x = nx;
+                            fc.y = ny;
+                        }
+                    }
+                } else {
+                    if !ctx.tracking {
+                        let mut tme: TRACKMOUSEEVENT = zeroed();
+                        tme.cbSize = size_of::<TRACKMOUSEEVENT>() as u32;
+                        tme.dwFlags = TME_LEAVE;
+                        tme.hwndTrack = hwnd;
+                        TrackMouseEvent(&mut tme);
+                        ctx.tracking = true;
+                    }
+                    let hover = match ctx.kind {
+                        Kind::Taskbar => taskbar_metric_at(hwnd, ctx),
+                        Kind::Float(m) => Some(m),
+                    };
+                    if ctx.hover != hover {
+                        ctx.hover = hover;
+                        InvalidateRect(hwnd, null(), 0);
+                    }
+                }
+            }
+            0
+        }
+        0x02A3 => {
+            let ctx = ctx_ptr(hwnd);
+            if let Some(ctx) = ctx.as_mut() {
+                ctx.tracking = false;
+                if ctx.hover.take().is_some() {
+                    InvalidateRect(hwnd, null(), 0);
                 }
             }
             0
@@ -927,20 +1219,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> L
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 drop(Box::from_raw(ctx));
                 if !app.is_null() {
-                    let a = &mut *app;
-                    match kind {
-                        Kind::Taskbar => {
-                            let mut nid: NOTIFYICONDATAW = zeroed();
-                            nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
-                            nid.hWnd = hwnd;
-                            nid.uID = TRAY_ID;
-                            Shell_NotifyIconW(NIM_DELETE, &nid);
-                            KillTimer(hwnd, TIMER_ID);
-                            PostQuitMessage(0);
-                        }
-                        Kind::Float(m) => {
-                            a.floats.retain(|(x, _)| *x != m);
-                        }
+                    if let Kind::Taskbar = kind {
+                        let mut nid: NOTIFYICONDATAW = zeroed();
+                        nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+                        nid.hWnd = hwnd;
+                        nid.uID = TRAY_ID;
+                        Shell_NotifyIconW(NIM_DELETE, &nid);
+                        KillTimer(hwnd, TIMER_ID);
+                        PostQuitMessage(0);
                     }
                 }
             }

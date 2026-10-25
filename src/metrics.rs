@@ -315,13 +315,15 @@ impl Metric {
         }
     }
 
-    pub fn key(self) -> &'static str {
+    pub fn short(self) -> &'static str {
         match self {
-            Metric::Cpu => "cpu",
-            Metric::Ram => "ram",
-            Metric::Net => "net",
-            Metric::Disk => "disk",
-            Metric::Capacity => "capacity",
+            Metric::Cpu => "C",
+            Metric::Ram => "R",
+            Metric::Net => "N",
+            Metric::Disk => "IO",
+            Metric::Capacity => "V",
         }
     }
+
+
 }

@@ -26,9 +26,13 @@ pub struct Config {
     pub show_disk: bool,
     pub show_capacity: bool,
     pub graph: Graph,
+    pub graphs: GraphMap,
     pub graph_width: i32,
-    pub float_transparent: bool,
-    pub float_topmost: bool,
+    pub compact: bool,
+    pub bar_transparent: bool,
+    pub bar_bg: String,
+    pub bar_opacity: u8,
+    pub views: Views,
     pub floats: Floats,
 }
 
@@ -50,10 +54,14 @@ impl Default for Config {
             show_net: true,
             show_disk: true,
             show_capacity: true,
-            graph: Graph::None,
-            graph_width: 96,
-            float_transparent: true,
-            float_topmost: true,
+            graph: Graph::Bar,
+            graphs: GraphMap::default(),
+            graph_width: 48,
+            compact: false,
+            bar_transparent: false,
+            bar_bg: "#202020".into(),
+            bar_opacity: 80,
+            views: Views::default(),
             floats: Floats::default(),
         }
     }
@@ -87,6 +95,58 @@ impl Config {
             Metric::Net => &self.floats.net,
             Metric::Disk => &self.floats.disk,
             Metric::Capacity => &self.floats.capacity,
+        }
+    }
+
+    pub fn graph_for(&self, m: Metric) -> Graph {
+        let g = match m {
+            Metric::Cpu => self.graphs.cpu,
+            Metric::Ram => self.graphs.ram,
+            Metric::Net => self.graphs.net,
+            Metric::Disk => self.graphs.disk,
+            Metric::Capacity => self.graphs.capacity,
+        };
+        g.unwrap_or(self.graph)
+    }
+
+    pub fn set_graph_for(&mut self, m: Metric, g: Graph) {
+        match m {
+            Metric::Cpu => self.graphs.cpu = Some(g),
+            Metric::Ram => self.graphs.ram = Some(g),
+            Metric::Net => self.graphs.net = Some(g),
+            Metric::Disk => self.graphs.disk = Some(g),
+            Metric::Capacity => self.graphs.capacity = Some(g),
+        }
+    }
+
+    pub fn set_graph_all(&mut self, g: Graph) {
+        self.graph = g;
+        self.graphs = GraphMap {
+            cpu: Some(g),
+            ram: Some(g),
+            net: Some(g),
+            disk: Some(g),
+            capacity: Some(g),
+        };
+    }
+
+    pub fn view(&self, m: Metric) -> ViewMode {
+        match m {
+            Metric::Cpu => self.views.cpu,
+            Metric::Ram => self.views.ram,
+            Metric::Net => self.views.net,
+            Metric::Disk => self.views.disk,
+            Metric::Capacity => self.views.capacity,
+        }
+    }
+
+    pub fn view_mut(&mut self, m: Metric) -> &mut ViewMode {
+        match m {
+            Metric::Cpu => &mut self.views.cpu,
+            Metric::Ram => &mut self.views.ram,
+            Metric::Net => &mut self.views.net,
+            Metric::Disk => &mut self.views.disk,
+            Metric::Capacity => &mut self.views.capacity,
         }
     }
 
@@ -164,12 +224,90 @@ impl Theme {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct GraphMap {
+    pub cpu: Option<Graph>,
+    pub ram: Option<Graph>,
+    pub net: Option<Graph>,
+    pub disk: Option<Graph>,
+    pub capacity: Option<Graph>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ViewMode {
+    Text,
+    Graph,
+    Both,
+}
+
+impl ViewMode {
+    pub const ALL: [ViewMode; 3] = [ViewMode::Text, ViewMode::Graph, ViewMode::Both];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ViewMode::Text => "Metin",
+            ViewMode::Graph => "Grafik",
+            ViewMode::Both => "Metin+Grafik",
+        }
+    }
+
+    pub fn index(self) -> usize {
+        match self {
+            ViewMode::Text => 0,
+            ViewMode::Graph => 1,
+            ViewMode::Both => 2,
+        }
+    }
+
+    pub fn from_index(i: usize) -> ViewMode {
+        ViewMode::ALL.get(i).copied().unwrap_or(ViewMode::Text)
+    }
+
+    pub fn has_text(self) -> bool {
+        matches!(self, ViewMode::Text | ViewMode::Both)
+    }
+
+    pub fn has_graph(self) -> bool {
+        matches!(self, ViewMode::Graph | ViewMode::Both)
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct Views {
+    pub cpu: ViewMode,
+    pub ram: ViewMode,
+    pub net: ViewMode,
+    pub disk: ViewMode,
+    pub capacity: ViewMode,
+}
+
+impl Default for Views {
+    fn default() -> Self {
+        Views {
+            cpu: ViewMode::Both,
+            ram: ViewMode::Text,
+            net: ViewMode::Text,
+            disk: ViewMode::Text,
+            capacity: ViewMode::Text,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct FloatCfg {
     pub on: bool,
     pub x: i32,
     pub y: i32,
+    pub transparent: bool,
+    pub topmost: bool,
+    pub bg: String,
+    pub opacity: u8,
+    pub border: bool,
+    pub border_color: String,
 }
 
 impl Default for FloatCfg {
@@ -178,11 +316,32 @@ impl Default for FloatCfg {
             on: false,
             x: 40,
             y: 60,
+            transparent: true,
+            topmost: true,
+            bg: "#1c1c1e".into(),
+            opacity: 100,
+            border: false,
+            border_color: "#4b4b52".into(),
         }
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub fn parse_color(s: &str) -> Option<[u8; 3]> {
+    let t = s.trim().trim_start_matches('#');
+    if t.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&t[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&t[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&t[4..6], 16).ok()?;
+    Some([r, g, b])
+}
+
+pub fn hex_color(c: [u8; 3]) -> String {
+    format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct Floats {
     pub cpu: FloatCfg,
@@ -192,20 +351,28 @@ pub struct Floats {
     pub capacity: FloatCfg,
 }
 
-impl Floats {
-    pub fn prepare(&mut self) {
-        self.cpu.y = 60;
-        self.ram.y = 104;
-        self.net.y = 148;
-        self.disk.y = 192;
-        self.capacity.y = 236;
+impl Default for Floats {
+    fn default() -> Self {
+        let at = |y| FloatCfg {
+            y,
+            ..FloatCfg::default()
+        };
+        Floats {
+            cpu: at(60),
+            ram: at(104),
+            net: at(148),
+            disk: at(192),
+            capacity: at(236),
+        }
     }
 }
 
 #[derive(Clone, Copy)]
 pub struct Palette {
     pub bg: [u8; 3],
+    pub surface: [u8; 3],
     pub label: [u8; 3],
+    pub text: [u8; 3],
     pub cpu: [u8; 3],
     pub ram: [u8; 3],
     pub net: [u8; 3],
@@ -214,32 +381,39 @@ pub struct Palette {
     pub cap: [u8; 3],
     pub warn: [u8; 3],
     pub divider: [u8; 3],
+    pub accent: [u8; 3],
 }
 
 const DARK: Palette = Palette {
-    bg: [28, 28, 30],
-    label: [150, 152, 158],
-    cpu: [86, 182, 255],
-    ram: [126, 207, 138],
-    net: [240, 178, 90],
-    net_up: [190, 140, 255],
+    bg: [32, 32, 32],
+    surface: [45, 45, 45],
+    label: [157, 157, 157],
+    text: [255, 255, 255],
+    cpu: [76, 194, 255],
+    ram: [108, 203, 95],
+    net: [255, 185, 72],
+    net_up: [180, 140, 255],
     disk: [255, 138, 101],
-    cap: [196, 212, 120],
-    warn: [255, 94, 87],
-    divider: [72, 72, 78],
+    cap: [197, 217, 122],
+    warn: [255, 95, 87],
+    divider: [58, 58, 58],
+    accent: [0, 120, 212],
 };
 
 const LIGHT: Palette = Palette {
     bg: [243, 243, 243],
-    label: [96, 98, 104],
-    cpu: [0, 112, 190],
-    ram: [36, 130, 62],
-    net: [166, 100, 8],
-    net_up: [110, 60, 170],
-    disk: [196, 78, 48],
-    cap: [86, 114, 18],
-    warn: [190, 30, 30],
-    divider: [204, 204, 209],
+    surface: [255, 255, 255],
+    label: [93, 93, 93],
+    text: [26, 26, 26],
+    cpu: [0, 103, 192],
+    ram: [16, 124, 16],
+    net: [157, 93, 0],
+    net_up: [107, 79, 187],
+    disk: [196, 62, 28],
+    cap: [92, 122, 26],
+    warn: [196, 43, 28],
+    divider: [214, 214, 214],
+    accent: [0, 103, 192],
 };
 
 fn wide(s: &str) -> Vec<u16> {
@@ -263,8 +437,33 @@ unsafe fn system_uses_light_theme() -> bool {
     rc == 0 && data == 1
 }
 
+unsafe fn system_accent(fallback: [u8; 3]) -> [u8; 3] {
+    let sub = wide("Software\\Microsoft\\Windows\\DWM");
+    let name = wide("AccentColor");
+    let mut v: u32 = 0;
+    let mut cb = std::mem::size_of::<u32>() as u32;
+    let rc = RegGetValueW(
+        HKEY_CURRENT_USER,
+        sub.as_ptr(),
+        name.as_ptr(),
+        RRF_RT_REG_DWORD,
+        null_mut(),
+        &mut v as *mut u32 as *mut c_void,
+        &mut cb,
+    );
+    if rc == 0 && (v & 0x00FF_FFFF) != 0 {
+        [
+            (v & 0xFF) as u8,
+            ((v >> 8) & 0xFF) as u8,
+            ((v >> 16) & 0xFF) as u8,
+        ]
+    } else {
+        fallback
+    }
+}
+
 pub fn palette(theme: Theme) -> Palette {
-    match theme {
+    let mut p = match theme {
         Theme::Dark => DARK,
         Theme::Light => LIGHT,
         Theme::Auto => {
@@ -274,7 +473,14 @@ pub fn palette(theme: Theme) -> Palette {
                 DARK
             }
         }
-    }
+    };
+    p.accent = unsafe { system_accent(p.accent) };
+    p
+}
+
+pub fn is_dark(p: &Palette) -> bool {
+    let l = p.bg[0] as u32 + p.bg[1] as u32 + p.bg[2] as u32;
+    l < 380
 }
 
 pub fn load() -> (Config, PathBuf) {
@@ -283,12 +489,11 @@ pub fn load() -> (Config, PathBuf) {
         .unwrap_or_else(|_| PathBuf::from("."))
         .join("statmon");
     let path = dir.join("config.json");
-    let mut cfg = std::fs::read_to_string(&path)
+    let cfg = std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str::<Config>(&s).ok())
         .unwrap_or_default();
     if !path.exists() {
-        cfg.floats.prepare();
         let _ = std::fs::create_dir_all(&dir);
         save(&cfg, &path);
     }
