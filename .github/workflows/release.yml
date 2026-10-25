@@ -49,9 +49,25 @@ jobs:
       #   SIGNPATH_SIGNING_POLICY_SLUG
       #   SIGNPATH_ARTIFACT_CONFIG_SLUG
       # Without them the release is published unsigned.
+      # Note: `secrets` is not available in `if:` expressions, so the
+      # configuration is checked in a separate step.
+      - name: Check signing configuration
+        id: signcfg
+        shell: pwsh
+        env:
+          SIGNPATH_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          ORG_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          POLICY_SLUG: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          CONFIG_SLUG: ${{ vars.SIGNPATH_ARTIFACT_CONFIG_SLUG }}
+        run: |
+          $enabled = [bool]($env:SIGNPATH_TOKEN -and $env:ORG_ID -and $env:PROJECT_SLUG -and $env:POLICY_SLUG -and $env:CONFIG_SLUG)
+          "enabled=$($enabled.ToString().ToLower())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "SignPath signing enabled: $enabled"
+
       - name: Sign with SignPath
         id: signpath
-        if: ${{ secrets.SIGNPATH_API_TOKEN != '' && vars.SIGNPATH_ORGANIZATION_ID != '' && vars.SIGNPATH_PROJECT_SLUG != '' && vars.SIGNPATH_SIGNING_POLICY_SLUG != '' && vars.SIGNPATH_ARTIFACT_CONFIG_SLUG != '' }}
+        if: steps.signcfg.outputs.enabled == 'true'
         uses: signpath/github-action-submit-signing-request@v1
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
