@@ -764,6 +764,16 @@ unsafe fn place_taskbar(app: &mut App) {
         );
         app.taskbar_rect = target;
         app.taskbar_shown = true;
+    } else {
+        SetWindowPos(
+            app.taskbar_hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+        );
     }
     InvalidateRect(app.taskbar_hwnd, null(), 0);
 }
@@ -779,9 +789,9 @@ unsafe fn update_floats(app: &mut App) {
     let height = ((app.cfg.float_font_px * dpi / 96) * 2 + 10).max(22);
     for i in 0..app.floats.len() {
         let (m, h) = app.floats[i];
-        let (fx, fy) = {
+        let (fx, fy, topmost) = {
             let fc = app.cfg.float(m);
-            (fc.x, fc.y)
+            (fc.x, fc.y, fc.topmost)
         };
         let f = frame(app, Some(m), None);
         let width = ui::width(h, &f, fonts);
@@ -791,14 +801,15 @@ unsafe fn update_floats(app: &mut App) {
             fc.x = cx;
             fc.y = cy;
         }
+        let level = if topmost { HWND_TOPMOST } else { HWND_NOTOPMOST };
         SetWindowPos(
             h,
-            null_mut(),
+            level,
             cx,
             cy,
             width,
             height,
-            SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
         InvalidateRect(h, null(), 0);
     }
