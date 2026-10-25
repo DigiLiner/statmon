@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SignPath artifact configuration for StatMon release archives.
+
+  Upload this file in SignPath under:
+    Project -> Artifact configurations -> New artifact configuration
+
+  It signs statmon.exe inside the release ZIP. Keep the file layout of
+  statmon-<version>-win64.zip unchanged (exe at the archive root), otherwise
+  update the path below.
+-->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <zip-file>
+    <pe-file path="statmon.exe">
+      <authenticode-sign/>
+    </pe-file>
+  </zip-file>
+</artifact-configuration>

@@ -44,8 +44,27 @@ double-buffered.
 2. Extract anywhere and run `statmon.exe`.
 3. Right-click the widget or tray icon → **Settings** to configure.
 
-The binary is not code-signed, so Windows SmartScreen may show a warning
-(“More info” → “Run anyway”).
+## Unsigned builds, SmartScreen and Smart App Control
+
+StatMon releases are **not code-signed**, so Windows may block them:
+
+- **SmartScreen** (“Windows protected your PC”): click **More info → Run anyway**.
+  If the file came from a ZIP, you can also right-click `statmon.exe` →
+  Properties → **Unblock**.
+- **Smart App Control (SAC)** (Windows 11): SAC has **no per-app allow list** and
+  no “Run anyway” button. Unsigned or unknown publishers are blocked silently.
+  Options:
+  1. **Turn SAC off** — Settings → Privacy & security → Windows Security →
+     App & browser control → Smart App Control → **Off**. Warning: once turned
+     off, SAC cannot be re-enabled without reinstalling Windows.
+  2. **Use a signed build** — see [docs/SIGNING.md](docs/SIGNING.md). The release
+     workflow signs the executable automatically when certificate secrets are
+     configured.
+  3. Use a Windows 10 PC or a Windows 11 PC without SAC.
+
+Do not use “security bypass” tricks; a valid Authenticode signature (or SAC
+disabled) is the only supported path. Signing is done with `signtool` after the
+build — see the workflow and documentation.
 
 ## Usage
 
@@ -145,3 +164,11 @@ widget'ıdır (Rust + Win32, webview yok).
   (EN/DE/FR/ES/TR), Windows açılışında başlatma.
 - Kurulum: Releases'tan zip'i indirip `statmon.exe` çalıştırın. Derleme:
   `cargo build --release`. Lisans: MIT.
+
+**İmzasız exe uyarısı:** StatMon imzalı değildir. SmartScreen çıkarsa
+“Ek bilgi → Yine de çalıştır” deyin. **Smart App Control (SAC)** açıksa exe
+sessizce engellenir; SAC'ta uygulama izin listesi yoktur. Ya SAC'ı kapatın
+(Ayarlar → Gizlilik ve güvenlik → Windows Güvenliği → Uygulama ve tarayıcı
+denetimi → Akıllı Uygulama Denetimi → Kapalı; geri açmak Windows'u yeniden
+kurmadan mümkün değildir) ya imzalı bir sürüm kullanın
+(bkz. [docs/SIGNING.md](docs/SIGNING.md)) ya da SAC'sız bir PC kullanın.

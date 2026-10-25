@@ -10,6 +10,7 @@ Set-Location $root
 Write-Host "Building release..." -ForegroundColor Cyan
 cargo build --release
 
+if (Test-Path dist) { Remove-Item dist\* -Force }
 New-Item -ItemType Directory -Force dist | Out-Null
 Copy-Item target\release\statmon.exe dist\ -Force
 Copy-Item README.md, LICENSE dist\ -Force
@@ -17,6 +18,7 @@ Copy-Item README.md, LICENSE dist\ -Force
 $zip = "dist\statmon-$Version-win64.zip"
 Compress-Archive -Path dist\* -DestinationPath $zip -Force
 $hash = (Get-FileHash $zip -Algorithm SHA256).Hash
+"$hash  statmon-$Version-win64.zip" | Out-File -Encoding ascii dist\SHA256.txt
 Write-Host "Created $zip" -ForegroundColor Green
 Write-Host "SHA256: $hash"
 

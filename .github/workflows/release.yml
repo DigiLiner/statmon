@@ -21,17 +21,71 @@ jobs:
       - name: Build
         run: cargo build --release
 
-      - name: Package
+      - name: Package (unsigned)
         shell: pwsh
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches.Groups[1].Value
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/release/statmon.exe dist/
           Copy-Item README.md, LICENSE dist/
-          Compress-Archive -Path dist/* -DestinationPath "dist/statmon-$version-win64.zip" -Force
-          Get-FileHash "dist/statmon-$version-win64.zip" -Algorithm SHA256 | Format-List
+          $zip = "dist/statmon-$version-win64.zip"
+          Compress-Archive -Path dist/* -DestinationPath $zip -Force
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash
+          "$hash  statmon-$version-win64.zip" | Out-File -Encoding ascii dist/SHA256.txt
+          Get-Content dist/SHA256.txt
 
-      - uses: softprops/action-gh-release@v2
+      - name: Upload unsigned artifact
+        id: upload
+        uses: actions/upload-artifact@v4
         with:
-          files: dist/statmon-*-win64.zip
+          name: unsigned
+          path: dist/statmon-*-win64.zip
+          retention-days: 3
+
+      # SignPath.io Foundation signing. Configure the repository secret
+      # SIGNPATH_API_TOKEN and these repository variables:
+      #   SIGNPATH_ORGANIZATION_ID
+      #   SIGNPATH_PROJECT_SLUG
+      #   SIGNPATH_SIGNING_POLICY_SLUG
+      #   SIGNPATH_ARTIFACT_CONFIG_SLUG
+      # Without them the release is published unsigned.
+      - name: Sign with SignPath
+        id: signpath
+        if: ${{ secrets.SIGNPATH_API_TOKEN != '' && vars.SIGNPATH_ORGANIZATION_ID != '' && vars.SIGNPATH_PROJECT_SLUG != '' && vars.SIGNPATH_SIGNING_POLICY_SLUG != '' && vars.SIGNPATH_ARTIFACT_CONFIG_SLUG != '' }}
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIG_SLUG }}
+          github-artifact-id: ${{ steps.upload.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed
+
+      - name: Checksums (signed)
+        if: ${{ steps.signpath.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem signed/statmon-*-win64.zip | Select-Object -First 1
+          $hash = (Get-FileHash $zip.FullName -Algorithm SHA256).Hash
+          "$hash  $($zip.Name)" | Out-File -Encoding ascii signed/SHA256.txt
+          Get-Content signed/SHA256.txt
+
+      - name: Publish signed release
+        if: ${{ steps.signpath.outcome == 'success' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            signed/statmon-*-win64.zip
+            signed/SHA256.txt
+          generate_release_notes: true
+
+      - name: Publish unsigned release
+        if: ${{ steps.signpath.outcome == 'skipped' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/statmon-*-win64.zip
+            dist/SHA256.txt
           generate_release_notes: true
