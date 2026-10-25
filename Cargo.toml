@@ -2,6 +2,11 @@
 name = "statmon"
 version = "0.1.0"
 edition = "2021"
+description = "Tiny native Windows taskbar system monitor (CPU, RAM, network, disk, capacity)"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/DigiLiner/statmon"
+authors = ["DigiLiner"]
 
 [dependencies]
 windows-sys = { version = "0.59", features = [

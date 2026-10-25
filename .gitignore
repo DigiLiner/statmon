@@ -1,1 +1,5 @@
 /target
+/dist
+*.zip
+*.pdb
+*.log

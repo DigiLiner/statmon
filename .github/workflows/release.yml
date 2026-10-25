@@ -1,0 +1,37 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches.Groups[1].Value
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/statmon.exe dist/
+          Copy-Item README.md, LICENSE dist/
+          Compress-Archive -Path dist/* -DestinationPath "dist/statmon-$version-win64.zip" -Force
+          Get-FileHash "dist/statmon-$version-win64.zip" -Algorithm SHA256 | Format-List
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/statmon-*-win64.zip
+          generate_release_notes: true
