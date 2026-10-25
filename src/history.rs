@@ -8,6 +8,10 @@ pub struct History {
     pub disk: Vec<f32>,
     pub cap: Vec<f32>,
     pub net: Vec<f32>,
+    pub rx: Vec<f32>,
+    pub tx: Vec<f32>,
+    pub read: Vec<f32>,
+    pub write: Vec<f32>,
 }
 
 impl History {
@@ -18,6 +22,10 @@ impl History {
             disk: Vec::with_capacity(CAPACITY),
             cap: Vec::with_capacity(CAPACITY),
             net: Vec::with_capacity(CAPACITY),
+            rx: Vec::with_capacity(CAPACITY),
+            tx: Vec::with_capacity(CAPACITY),
+            read: Vec::with_capacity(CAPACITY),
+            write: Vec::with_capacity(CAPACITY),
         }
     }
 
@@ -31,6 +39,10 @@ impl History {
             .fold(0.0f32, |a, b| a.max(b));
         push(&mut self.cap, top);
         push(&mut self.net, (m.rx + m.tx) as f32);
+        push(&mut self.rx, m.rx as f32);
+        push(&mut self.tx, m.tx as f32);
+        push(&mut self.read, m.read_bps as f32);
+        push(&mut self.write, m.write_bps as f32);
     }
 
     pub fn series(&self, m: Metric) -> &[f32] {

@@ -1,11 +1,12 @@
 use std::mem::zeroed;
+use std::ptr::null_mut;
 
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
     CreateSolidBrush, DeleteDC, DeleteObject, Ellipse, EndPaint, FillRect, GetDC, GetStockObject,
     GetTextExtentPoint32W, Pie, Polyline, ReleaseDC, SelectObject, SetBkMode, SetBrushOrgEx,
-    SetStretchBltMode, SetTextColor, StretchBlt, TextOutW, ANTIALIASED_QUALITY, CLEARTYPE_QUALITY,
+    SetStretchBltMode, SetTextColor, StretchBlt, TextOutW, BitBlt, CreateRoundRectRgn, FillRgn, ANTIALIASED_QUALITY, CLEARTYPE_QUALITY,
     CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD,
     HALFTONE, HDC, HFONT, NULL_PEN, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
 };
@@ -13,6 +14,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect;
 
 use crate::config::{Config, Graph, Palette};
 use crate::history::History;
+use crate::lang::{t, K};
 use crate::metrics::{DriveInfo, Metric, Metrics};
 
 pub const KEY: [u8; 3] = [1, 1, 1];
@@ -142,6 +144,7 @@ enum ChartKind {
     Bar,
     Line,
     Pie,
+    Led,
 }
 
 pub struct Chart {
@@ -180,6 +183,10 @@ pub struct Frame<'a> {
     pub hover: Option<Metric>,
     pub vertical: bool,
     pub thickness: i32,
+    pub fit_compact: bool,
+    pub hide_charts: bool,
+    pub max_tiles: usize,
+    pub led: [[f32; 2]; 5],
 }
 
 impl<'a> Frame<'a> {
@@ -188,7 +195,16 @@ impl<'a> Frame<'a> {
     }
 
     fn compact(&self) -> bool {
-        (self.cfg.compact || self.vertical) && !self.big()
+        (self.cfg.compact || self.vertical || self.fit_compact) && !self.big()
+    }
+
+    fn chart_px_for(&self, m: Metric) -> i32 {
+        let base = self.chart_px();
+        if !self.vertical && self.cfg.graph_for(m) == Graph::Led {
+            (base + 12).max(44)
+        } else {
+            base
+        }
     }
 
     fn chart_px(&self) -> i32 {
@@ -209,12 +225,21 @@ impl<'a> Frame<'a> {
                 .collect(),
         };
         let mut tiles = Vec::with_capacity(list.len());
-        for m in list {
+        let limit = if self.max_tiles > 0 {
+            list.len().min(self.max_tiles)
+        } else {
+            list.len()
+        };
+        for m in list.into_iter().take(limit) {
             let mode = self.cfg.view(m);
             let kind = self.cfg.graph_for(m);
-            let can_graph = mode.has_graph() && kind != Graph::None;
-            let show_text = mode.has_text() || !can_graph;
-            let chart = if can_graph { self.chart_for(m, kind) } else { None };
+            let want_graph = mode.has_graph() && kind != Graph::None;
+            let chart = if want_graph && !self.hide_charts {
+                self.chart_for(m, kind)
+            } else {
+                None
+            };
+            let show_text = mode.has_text() || chart.is_none();
             let has_chart = chart.is_some();
             let label = if m == Metric::Capacity {
                 if has_chart {
@@ -249,6 +274,11 @@ impl<'a> Frame<'a> {
         let p = self.palette;
         let h = self.history;
         let data = h.series(m);
+        let rate_max = |a: &[f32], b: &[f32]| -> f32 {
+            let ta = a.iter().fold(0.0f32, |x, y| x.max(*y));
+            let tb = b.iter().fold(0.0f32, |x, y| x.max(*y));
+            (ta.max(tb) * 1.2).max(65536.0)
+        };
         match kind {
             Graph::None => None,
             Graph::Bar => Some(Chart {
@@ -283,6 +313,37 @@ impl<'a> Frame<'a> {
                         max: 100.0,
                     })
                 }
+            }
+            Graph::Led => {
+                let (mut lines, max) = match m {
+                    Metric::Net => (
+                        vec![
+                            (h.rx.clone(), p.net),
+                            (h.tx.clone(), p.net_up),
+                        ],
+                        rate_max(&h.rx, &h.tx),
+                    ),
+                    Metric::Disk => (
+                        vec![
+                            (h.read.clone(), p.disk),
+                            (h.write.clone(), p.disk_up),
+                        ],
+                        rate_max(&h.read, &h.write),
+                    ),
+                    _ => (
+                        vec![(data.to_vec(), metric_color(m, p))],
+                        chart_max(m, data),
+                    ),
+                };
+                if lines.len() == 2 && lines[1].0.is_empty() {
+                    lines.pop();
+                }
+                Some(Chart {
+                    kind: ChartKind::Led,
+                    lines,
+                    pie: Vec::new(),
+                    max,
+                })
             }
         }
     }
@@ -509,7 +570,6 @@ pub unsafe fn width(hwnd: HWND, f: &Frame, fonts: &Fonts) -> i32 {
     }
     let hdc = GetDC(hwnd);
     let big = f.big();
-    let chart_px = f.chart_px();
     let mut total = f.cfg.pad_x * 2;
     for (i, t) in f.tiles().iter().enumerate() {
         if i > 0 {
@@ -519,7 +579,7 @@ pub unsafe fn width(hwnd: HWND, f: &Frame, fonts: &Fonts) -> i32 {
                 f.cfg.divider_gap * 2 + 1
             };
         }
-        total += tile_width(hdc, t, fonts, big, chart_px);
+        total += tile_width(hdc, t, fonts, big, f.chart_px_for(t.metric));
     }
     ReleaseDC(hwnd, hdc);
     total
@@ -557,7 +617,6 @@ pub unsafe fn ranges(hwnd: HWND, f: &Frame, fonts: &Fonts) -> Vec<(Metric, i32, 
     }
     let hdc = GetDC(hwnd);
     let big = f.big();
-    let chart_px = f.chart_px();
     let mut x = f.cfg.pad_x;
     for (i, t) in tiles.iter().enumerate() {
         if i > 0 {
@@ -568,7 +627,7 @@ pub unsafe fn ranges(hwnd: HWND, f: &Frame, fonts: &Fonts) -> Vec<(Metric, i32, 
             };
         }
         let start = x;
-        x += tile_width(hdc, t, fonts, big, chart_px);
+        x += tile_width(hdc, t, fonts, big, f.chart_px_for(t.metric));
         out.push((t.metric, start, x));
     }
     ReleaseDC(hwnd, hdc);
@@ -586,9 +645,18 @@ pub unsafe fn tile_at(hwnd: HWND, f: &Frame, fonts: &Fonts, pos: i32) -> Option<
 
 pub unsafe fn paint(hwnd: HWND, f: &Frame, fonts: &Fonts, look: &Look) {
     let mut ps: PAINTSTRUCT = zeroed();
-    let hdc = BeginPaint(hwnd, &mut ps);
+    let win = BeginPaint(hwnd, &mut ps);
     let mut rc: RECT = zeroed();
     GetClientRect(hwnd, &mut rc);
+    let mem = CreateCompatibleDC(win);
+    let bmp = CreateCompatibleBitmap(win, rc.right.max(1), rc.bottom.max(1));
+    let buffered = !mem.is_null() && !bmp.is_null();
+    let old_bmp = if buffered {
+        SelectObject(mem, bmp)
+    } else {
+        null_mut()
+    };
+    let hdc = if buffered { mem } else { win };
 
     let bg = if look.transparent { KEY } else { look.bg };
     let bg_br = CreateSolidBrush(rgb(bg));
@@ -652,7 +720,7 @@ pub unsafe fn paint(hwnd: HWND, f: &Frame, fonts: &Fonts, look: &Look) {
                     right: left + cw,
                     bottom: cy + 24,
                 };
-                draw_chart(hdc, &r, ch, f.palette, bg);
+                draw_chart(hdc, &r, ch, f.palette, bg, f.led[t.metric.index()]);
                 cy += 26;
             }
             for (text, color) in f.vertical_lines(t) {
@@ -666,7 +734,6 @@ pub unsafe fn paint(hwnd: HWND, f: &Frame, fonts: &Fonts, look: &Look) {
         }
     } else {
         let h = rc.bottom - rc.top;
-        let chart_px = f.chart_px();
         let mut x = f.cfg.pad_x;
         for (i, t) in tiles.iter().enumerate() {
             if i > 0 {
@@ -688,7 +755,8 @@ pub unsafe fn paint(hwnd: HWND, f: &Frame, fonts: &Fonts, look: &Look) {
             }
 
             let start = x;
-            let tw = tile_width(hdc, t, fonts, big, chart_px);
+            let cp = f.chart_px_for(t.metric);
+            let tw = tile_width(hdc, t, fonts, big, cp);
 
             if f.hover == Some(t.metric) {
                 let hl = blend(bg, f.palette.accent, 0.22);
@@ -728,11 +796,11 @@ pub unsafe fn paint(hwnd: HWND, f: &Frame, fonts: &Fonts, look: &Look) {
                 let r = RECT {
                     left: cx,
                     top: 3,
-                    right: cx + chart_px,
+                    right: cx + cp,
                     bottom: h - 3,
                 };
-                draw_chart(hdc, &r, ch, f.palette, bg);
-                cx += chart_px;
+                draw_chart(hdc, &r, ch, f.palette, bg, f.led[t.metric.index()]);
+                cx += cp;
                 first = false;
             }
 
@@ -785,6 +853,12 @@ pub unsafe fn paint(hwnd: HWND, f: &Frame, fonts: &Fonts, look: &Look) {
         DeleteObject(br);
     }
 
+    if buffered {
+        BitBlt(win, 0, 0, rc.right, rc.bottom, hdc, 0, 0, SRCCOPY);
+        SelectObject(hdc, old_bmp);
+        DeleteObject(bmp);
+        DeleteDC(hdc);
+    }
     EndPaint(hwnd, &mut ps);
 }
 
@@ -802,7 +876,14 @@ unsafe fn draw_text_at(hdc: HDC, x: i32, y0: i32, h: i32, s: &str, font: HFONT, 
     TextOutW(hdc, x, y, w.as_ptr(), w.len() as i32);
 }
 
-unsafe fn draw_chart(hdc: HDC, r: &RECT, ch: &Chart, p: &Palette, bg: [u8; 3]) {
+unsafe fn draw_chart(
+    hdc: HDC,
+    r: &RECT,
+    ch: &Chart,
+    p: &Palette,
+    bg: [u8; 3],
+    led: [f32; 2],
+) {
     let w = r.right - r.left;
     let h = r.bottom - r.top;
     if w < 8 || h < 6 {
@@ -817,7 +898,7 @@ unsafe fn draw_chart(hdc: HDC, r: &RECT, ch: &Chart, p: &Palette, bg: [u8; 3]) {
         if !mem.is_null() {
             DeleteDC(mem);
         }
-        draw_chart_raw(hdc, r, ch, p, bg, 1);
+        draw_chart_raw(hdc, r, ch, p, bg, 1, led);
         return;
     }
     let old = SelectObject(mem, bmp);
@@ -830,7 +911,7 @@ unsafe fn draw_chart(hdc: HDC, r: &RECT, ch: &Chart, p: &Palette, bg: [u8; 3]) {
     let br = CreateSolidBrush(rgb(bg));
     FillRect(mem, &big, br);
     DeleteObject(br);
-    draw_chart_raw(mem, &big, ch, p, bg, SS);
+    draw_chart_raw(mem, &big, ch, p, bg, SS, led);
     SetStretchBltMode(hdc, HALFTONE);
     SetBrushOrgEx(hdc, 0, 0, std::ptr::null_mut());
     StretchBlt(
@@ -851,7 +932,15 @@ unsafe fn draw_chart(hdc: HDC, r: &RECT, ch: &Chart, p: &Palette, bg: [u8; 3]) {
     DeleteDC(mem);
 }
 
-unsafe fn draw_chart_raw(hdc: HDC, r: &RECT, ch: &Chart, p: &Palette, bg: [u8; 3], s: i32) {
+unsafe fn draw_chart_raw(
+    hdc: HDC,
+    r: &RECT,
+    ch: &Chart,
+    p: &Palette,
+    bg: [u8; 3],
+    s: i32,
+    led: [f32; 2],
+) {
     let w = r.right - r.left;
     let h = r.bottom - r.top;
     let max = ch.max.max(1.0);
@@ -907,6 +996,7 @@ unsafe fn draw_chart_raw(hdc: HDC, r: &RECT, ch: &Chart, p: &Palette, bg: [u8; 3
                 DeleteObject(pen);
             }
         }
+        ChartKind::Led => draw_led(hdc, r, ch, led),
         ChartKind::Pie => {
             let cx = (r.left + r.right) / 2;
             let cy = (r.top + r.bottom) / 2;
@@ -952,4 +1042,160 @@ unsafe fn draw_chart_raw(hdc: HDC, r: &RECT, ch: &Chart, p: &Palette, bg: [u8; 3
             SelectObject(hdc, old_pen);
         }
     }
+}
+
+unsafe fn draw_led(hdc: HDC, r: &RECT, ch: &Chart, led: [f32; 2]) {
+    let w = r.right - r.left;
+    let h = r.bottom - r.top;
+    if w < 6 || h < 6 {
+        return;
+    }
+    let rows = ch.lines.len().clamp(1, 2) as i32;
+    let gap_y = if rows > 1 { 3 } else { 0 };
+    let row_h = ((h - gap_y) / rows).max(4);
+    for (i, (_data, color)) in ch.lines.iter().enumerate().take(2) {
+        let lvl = led[i.min(1)].clamp(0.0, 1.0);
+        let bright = 0.18 + 0.82 * lvl;
+        let c = [
+            (color[0] as f32 * bright) as u8,
+            (color[1] as f32 * bright) as u8,
+            (color[2] as f32 * bright) as u8,
+        ];
+        let y = r.top + i as i32 * (row_h + gap_y);
+        let br = CreateSolidBrush(rgb(c));
+        let rgn = CreateRoundRectRgn(r.left, y, r.right + 1, y + row_h + 1, 7, 7);
+        FillRgn(hdc, rgn, br);
+        DeleteObject(rgn);
+        DeleteObject(br);
+    }
+}
+pub fn tip_content(f: &Frame) -> (String, Vec<(String, String)>) {
+    let m = f.metric.unwrap_or(Metric::Cpu);
+    let lang = f.cfg.language;
+    let met = f.metrics;
+    let mut rows: Vec<(String, String)> = Vec::new();
+    match m {
+        Metric::Cpu => rows.push((
+            t(lang, K::Usage).into(),
+            format!("{:.0}%", met.cpu),
+        )),
+        Metric::Ram => {
+            rows.push((t(lang, K::Usage).into(), format!("{}%", met.mem_pct)));
+            rows.push((
+                t(lang, K::Used).into(),
+                format!("{:.1} GB", met.mem_used as f64 / 1073741824.0),
+            ));
+            rows.push((
+                t(lang, K::Total).into(),
+                format!("{:.1} GB", met.mem_total as f64 / 1073741824.0),
+            ));
+        }
+        Metric::Net => {
+            rows.push((
+                t(lang, K::Download).into(),
+                format!("{}/s", rate(met.rx)),
+            ));
+            rows.push((t(lang, K::Upload).into(), format!("{}/s", rate(met.tx))));
+        }
+        Metric::Disk => {
+            rows.push((
+                t(lang, K::Usage).into(),
+                format!("{:.0}%", met.disk_busy),
+            ));
+            rows.push((
+                t(lang, K::Read).into(),
+                format!("{}/s", rate(met.read_bps)),
+            ));
+            rows.push((
+                t(lang, K::Write).into(),
+                format!("{}/s", rate(met.write_bps)),
+            ));
+        }
+        Metric::Capacity => {
+            for d in f.drives {
+                rows.push((
+                    format!("{}:", d.letter),
+                    format!(
+                        "{}%  {:.0}/{:.0} GB",
+                        d.used_pct().round() as i64,
+                        (d.total - d.free) as f64 / 1073741824.0,
+                        d.total as f64 / 1073741824.0
+                    ),
+                ));
+            }
+        }
+    }
+    (m.label().to_string(), rows)
+}
+
+pub fn tip_size(f: &Frame) -> (i32, i32) {
+    let line = (f.cfg.font_value_px * f.dpi.max(96) as i32 / 96).max(10) + 8;
+    let (_, rows) = tip_content(f);
+    (260, 34 + rows.len() as i32 * line)
+}
+
+pub unsafe fn paint_tip(hwnd: HWND, f: &Frame, fonts: &Fonts, p: &Palette) {
+    let mut ps: PAINTSTRUCT = zeroed();
+    let win = BeginPaint(hwnd, &mut ps);
+    let mut rc: RECT = zeroed();
+    GetClientRect(hwnd, &mut rc);
+    let mem = CreateCompatibleDC(win);
+    let bmp = CreateCompatibleBitmap(win, rc.right.max(1), rc.bottom.max(1));
+    let buffered = !mem.is_null() && !bmp.is_null();
+    let old_bmp = if buffered {
+        SelectObject(mem, bmp)
+    } else {
+        null_mut()
+    };
+    let hdc = if buffered { mem } else { win };
+    let bg = CreateSolidBrush(rgb(p.bg));
+    FillRect(hdc, &rc, bg);
+    DeleteObject(bg);
+    SetBkMode(hdc, TRANSPARENT as i32);
+
+    let accent = CreateSolidBrush(rgb(p.accent));
+    let bar = RECT {
+        left: 0,
+        top: 0,
+        right: 4,
+        bottom: rc.bottom,
+    };
+    FillRect(hdc, &bar, accent);
+    DeleteObject(accent);
+
+    let (title, rows) = tip_content(f);
+    let m = f.metric.unwrap_or(Metric::Cpu);
+    let value_color = if m == Metric::Capacity
+        && f.drives.iter().any(|d| d.used_pct() >= 90.0)
+    {
+        p.warn
+    } else {
+        metric_color(m, p)
+    };
+
+    SelectObject(hdc, fonts.label(false));
+    SetTextColor(hdc, rgb(p.text));
+    let tw = title.encode_utf16().collect::<Vec<u16>>();
+    TextOutW(hdc, 14, 9, tw.as_ptr(), tw.len() as i32);
+
+    let line = (f.cfg.font_value_px * f.dpi.max(96) as i32 / 96).max(10) + 8;
+    let mut y = 30;
+    for (label, value) in rows {
+        draw_text_at(hdc, 14, y, line, &label, fonts.label(false), rgb(p.label));
+        let font = fonts.value(false);
+        SelectObject(hdc, font);
+        let vw = value.encode_utf16().collect::<Vec<u16>>();
+        let mut sz: SIZE = zeroed();
+        GetTextExtentPoint32W(hdc, vw.as_ptr(), vw.len() as i32, &mut sz);
+        let x = (rc.right - 14 - sz.cx).max(60);
+        draw_text_at(hdc, x, y, line, &value, font, rgb(value_color));
+        y += line;
+    }
+    if buffered {
+        BitBlt(win, 0, 0, rc.right, rc.bottom, hdc, 0, 0, SRCCOPY);
+        SelectObject(hdc, old_bmp);
+        DeleteObject(bmp);
+        DeleteDC(hdc);
+    }
+    EndPaint(hwnd, &mut ps);
 }

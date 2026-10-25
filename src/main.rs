@@ -42,6 +42,7 @@ use metrics::{DriveInfo, Metric, Metrics};
 use ui::{Fonts, Frame};
 
 const TIMER_ID: usize = 1;
+const TIMER_ANIM: usize = 2;
 const TRAY_ID: u32 = 1;
 const WM_TRAY: u32 = WM_APP + 1;
 
@@ -79,6 +80,18 @@ pub(crate) struct App {
     pub(crate) settings_target: Option<Metric>,
     taskbar_vertical: bool,
     taskbar_thickness: i32,
+    taskbar_rect: RECT,
+    taskbar_shown: bool,
+    fit_compact: bool,
+    fit_hide_charts: bool,
+    fit_tiles: usize,
+    menu_open: bool,
+    led: [[f32; 2]; 5],
+    led_target: [[f32; 2]; 5],
+    tip_hwnd: HWND,
+    tip_metric: Option<Metric>,
+    tip_anchor: RECT,
+    tip_anchor_vertical: bool,
     floats: Vec<(Metric, HWND)>,
     hidden: bool,
     tick: u32,
@@ -182,6 +195,18 @@ unsafe fn run() {
         settings_target: None,
         taskbar_vertical: false,
         taskbar_thickness: 0,
+        taskbar_rect: zeroed(),
+        taskbar_shown: false,
+        fit_compact: false,
+        fit_hide_charts: false,
+        fit_tiles: 0,
+        menu_open: false,
+        led: [[0.0; 2]; 5],
+        led_target: [[0.0; 2]; 5],
+        tip_hwnd: null_mut(),
+        tip_metric: None,
+        tip_anchor: zeroed(),
+        tip_anchor_vertical: false,
         floats: Vec::new(),
         hidden: false,
         tick: 0,
@@ -196,6 +221,7 @@ unsafe fn run() {
 
     tray_add(hwnd);
     SetTimer(hwnd, TIMER_ID, (*app).cfg.refresh_ms, None);
+    SetTimer(hwnd, TIMER_ANIM, 90, None);
     refresh(&mut *app);
     sync_floats(&mut *app);
     update_floats(&mut *app);
@@ -384,6 +410,7 @@ impl App {
         sync_floats(self);
         apply_bar_style(self);
         SetTimer(self.taskbar_hwnd, TIMER_ID, self.cfg.refresh_ms, None);
+        SetTimer(self.taskbar_hwnd, TIMER_ANIM, 90, None);
         refresh(self);
     }
 
@@ -406,13 +433,7 @@ unsafe fn taskbar_metric_at(hwnd: HWND, ctx: &WinCtx) -> Option<Metric> {
     let mut p: POINT = zeroed();
     GetCursorPos(&mut p);
     ScreenToClient(hwnd, &mut p);
-    let f = frame(
-        app,
-        None,
-        None,
-        app.taskbar_vertical,
-        app.taskbar_thickness,
-    );
+    let f = frame(app, None, None);
     ui::tile_at(
         hwnd,
         &f,
@@ -421,12 +442,30 @@ unsafe fn taskbar_metric_at(hwnd: HWND, ctx: &WinCtx) -> Option<Metric> {
     )
 }
 
-unsafe fn frame<'a>(
+unsafe fn frame<'a>(app: &'a App, metric: Option<Metric>, hover: Option<Metric>) -> Frame<'a> {
+    let bar = metric.is_none();
+    frame_fit(
+        app,
+        metric,
+        hover,
+        bar && app.taskbar_vertical,
+        if bar { app.taskbar_thickness } else { 0 },
+        bar && app.fit_compact,
+        bar && app.fit_hide_charts,
+        if bar { app.fit_tiles } else { 0 },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn frame_fit<'a>(
     app: &'a App,
     metric: Option<Metric>,
     hover: Option<Metric>,
     vertical: bool,
     thickness: i32,
+    fit_compact: bool,
+    hide_charts: bool,
+    max_tiles: usize,
 ) -> Frame<'a> {
     Frame {
         metrics: &app.metrics,
@@ -439,6 +478,96 @@ unsafe fn frame<'a>(
         hover,
         vertical,
         thickness,
+        fit_compact,
+        hide_charts,
+        max_tiles,
+        led: app.led,
+    }
+}
+
+fn any_led(cfg: &Config) -> bool {
+    Metric::ALL.iter().any(|m| {
+        cfg.shows(*m) && cfg.view(*m).has_graph() && cfg.graph_for(*m) == Graph::Led
+    })
+}
+
+fn scale_rate(rate: f64, max: f32) -> f32 {
+    let n = (rate as f32 / max).clamp(0.0, 1.0).powf(0.45);
+    if rate >= 65536.0 {
+        n.max(0.55)
+    } else if rate >= 1024.0 {
+        n.max(0.35)
+    } else {
+        n
+    }
+}
+
+unsafe fn update_led_targets(app: &mut App) {
+    let (net_max, disk_max) = {
+        let h = &app.history;
+        let n = h
+            .rx
+            .iter()
+            .chain(h.tx.iter())
+            .fold(0.0f32, |a, b| a.max(*b))
+            .max(65536.0);
+        let d = h
+            .read
+            .iter()
+            .chain(h.write.iter())
+            .fold(0.0f32, |a, b| a.max(*b))
+            .max(65536.0);
+        (n, d)
+    };
+    let cap = app
+        .drives
+        .iter()
+        .map(|d| d.used_pct())
+        .fold(0.0f32, |a, b| a.max(b))
+        / 100.0;
+
+    let targets = [
+        [(app.metrics.cpu / 100.0).clamp(0.0, 1.0), 0.0],
+        [(app.metrics.mem_pct as f32 / 100.0).clamp(0.0, 1.0), 0.0],
+        [
+            scale_rate(app.metrics.rx, net_max),
+            scale_rate(app.metrics.tx, net_max),
+        ],
+        [
+            scale_rate(app.metrics.read_bps, disk_max),
+            scale_rate(app.metrics.write_bps, disk_max),
+        ],
+        [cap.clamp(0.0, 1.0), 0.0],
+    ];
+    app.led_target = targets;
+}
+
+unsafe fn animate_led(app: &mut App) {
+    if !any_led(&app.cfg) {
+        return;
+    }
+    let mut active = false;
+    for i in 0..5 {
+        for k in 0..2 {
+            let target = app.led_target[i][k].clamp(0.0, 1.0);
+            let cur = app.led[i][k];
+            let diff = target - cur;
+            if diff.abs() > 0.004 {
+                app.led[i][k] = cur + diff * 0.18;
+                active = true;
+            } else {
+                app.led[i][k] = target;
+            }
+        }
+    }
+    if !active {
+        return;
+    }
+    if !app.taskbar_hwnd.is_null() {
+        InvalidateRect(app.taskbar_hwnd, null(), 0);
+    }
+    for (_, h) in &app.floats {
+        InvalidateRect(*h, null(), 0);
     }
 }
 
@@ -450,10 +579,15 @@ unsafe fn refresh(app: &mut App) {
         app.last_capacity = Instant::now();
     }
     app.history.push(&app.metrics, &app.drives);
+    update_led_targets(app);
 
     ensure_fonts(app);
     place_taskbar(app);
     update_floats(app);
+
+    if app.tip_metric.is_some() {
+        update_tip(app);
+    }
 
     app.tick = app.tick.wrapping_add(1);
     if app.tick % 5 == 1 {
@@ -478,6 +612,9 @@ unsafe fn ensure_fonts(app: &mut App) {
 }
 
 unsafe fn place_taskbar(app: &mut App) {
+    if app.menu_open {
+        return;
+    }
     if foreground_is_fullscreen(app.taskbar_hwnd) {
         set_hidden(app, true);
         return;
@@ -504,54 +641,137 @@ unsafe fn place_taskbar(app: &mut App) {
         set_hidden(app, true);
         return;
     }
-    set_hidden(app, false);
-
-    let Some(fonts) = app.fonts.as_ref() else {
-        return;
-    };
-
     app.taskbar_vertical = !horizontal;
     app.taskbar_thickness = thickness;
 
-    let (width, height, x, y) = if horizontal {
-        let f = frame(app, None, None, false, thickness);
-        let width = ui::width(app.taskbar_hwnd, &f, fonts);
-        let height = (thickness - VPAD * 2).max(16);
-        let limit = if tray.left > tb.left + 8 && tray.left < tb.right {
+    let limit = if horizontal {
+        if tray.left > tb.left + 8 && tray.left < tb.right {
             tray.left
         } else {
             tb.right
-        };
-        let x = (limit - width - TASKBAR_GAP).max(tb.left + 4);
-        let y = tb.top + (thickness - height) / 2;
-        (width, height, x, y)
+        }
+    } else if tray.top > tb.top + 8 && tray.top < tb.bottom {
+        tray.top
     } else {
-        let f = frame(app, None, None, true, thickness);
-        let width = (thickness - 4).max(30);
-        let height = ui::height_vertical(&f);
-        let limit = if tray.top > tb.top + 8 && tray.top < tb.bottom {
-            tray.top
-        } else {
-            tb.bottom
-        };
-        let y = (limit - height - TASKBAR_GAP).max(tb.top + 4);
-        let x = tb.left + (thickness - width) / 2;
-        (width, height, x, y)
+        tb.bottom
+    };
+    let avail = if horizontal {
+        (limit - tb.left - 8).max(0)
+    } else {
+        (limit - tb.top - 8).max(0)
     };
 
-    SetWindowPos(
-        app.taskbar_hwnd,
-        HWND_TOPMOST,
-        x,
-        y,
-        width,
-        height,
-        SWP_NOACTIVATE | SWP_SHOWWINDOW,
-    );
+    let tiles_len = Metric::ALL
+        .iter()
+        .filter(|m| app.cfg.shows(**m))
+        .count();
+    if tiles_len == 0 {
+        set_hidden(app, true);
+        return;
+    }
+
+    let chosen = {
+        let Some(fonts) = app.fonts.as_ref() else {
+            return;
+        };
+        let measure = |c: bool, nc: bool, mt: usize| -> (i32, i32) {
+            let f = frame_fit(
+                app,
+                None,
+                None,
+                app.taskbar_vertical,
+                thickness,
+                c,
+                nc,
+                mt,
+            );
+            if horizontal {
+                (
+                    ui::width(app.taskbar_hwnd, &f, fonts),
+                    (thickness - VPAD * 2).max(16),
+                )
+            } else {
+                ((thickness - 4).max(30), ui::height_vertical(&f))
+            }
+        };
+        let fits = |w: i32, h: i32| {
+            if horizontal {
+                w <= avail
+            } else {
+                h <= avail
+            }
+        };
+        let mut out = None;
+        for (c, nc) in [(false, false), (true, false), (true, true)] {
+            let (w, h) = measure(c, nc, 0);
+            if fits(w, h) {
+                out = Some((c, nc, 0usize, w, h));
+                break;
+            }
+        }
+        if out.is_none() {
+            for n in (1..tiles_len).rev() {
+                let (w, h) = measure(true, true, n);
+                if fits(w, h) {
+                    out = Some((true, true, n, w, h));
+                    break;
+                }
+            }
+        }
+        out
+    };
+
+    let Some((fit_compact, hide_charts, max_tiles, width, height)) = chosen else {
+        set_hidden(app, true);
+        return;
+    };
+    app.fit_compact = fit_compact;
+    app.fit_hide_charts = hide_charts;
+    app.fit_tiles = max_tiles;
+
+    set_hidden(app, false);
+
+    let (x, y) = if horizontal {
+        (
+            (limit - width - TASKBAR_GAP).max(tb.left + 4),
+            tb.top + (thickness - height) / 2,
+        )
+    } else {
+        (
+            tb.left + (thickness - width) / 2,
+            (limit - height - TASKBAR_GAP).max(tb.top + 4),
+        )
+    };
+    let target = RECT {
+        left: x,
+        top: y,
+        right: x + width,
+        bottom: y + height,
+    };
+    let changed = target.left != app.taskbar_rect.left
+        || target.top != app.taskbar_rect.top
+        || target.right != app.taskbar_rect.right
+        || target.bottom != app.taskbar_rect.bottom;
+    if changed || !app.taskbar_shown {
+        SetWindowPos(
+            app.taskbar_hwnd,
+            HWND_TOPMOST,
+            x,
+            y,
+            width,
+            height,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+        app.taskbar_rect = target;
+        app.taskbar_shown = true;
+    }
     InvalidateRect(app.taskbar_hwnd, null(), 0);
 }
 
 unsafe fn update_floats(app: &mut App) {
+    if app.menu_open {
+        return;
+    }
     let Some(fonts) = app.fonts.as_ref() else {
         return;
     };
@@ -559,11 +779,11 @@ unsafe fn update_floats(app: &mut App) {
     let height = ((app.cfg.float_font_px * dpi / 96) * 2 + 10).max(22);
     for i in 0..app.floats.len() {
         let (m, h) = app.floats[i];
-        let (fx, fy, topmost) = {
+        let (fx, fy) = {
             let fc = app.cfg.float(m);
-            (fc.x, fc.y, fc.topmost)
+            (fc.x, fc.y)
         };
-        let f = frame(app, Some(m), None, false, 0);
+        let f = frame(app, Some(m), None);
         let width = ui::width(h, &f, fonts);
         let (cx, cy) = clamp_to_work(fx, fy, width, height);
         if cx != fx || cy != fy {
@@ -571,19 +791,14 @@ unsafe fn update_floats(app: &mut App) {
             fc.x = cx;
             fc.y = cy;
         }
-        let level = if topmost {
-            HWND_TOPMOST
-        } else {
-            HWND_NOTOPMOST
-        };
         SetWindowPos(
             h,
-            level,
+            null_mut(),
             cx,
             cy,
             width,
             height,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
         );
         InvalidateRect(h, null(), 0);
     }
@@ -607,6 +822,10 @@ unsafe fn set_hidden(app: &mut App, hidden: bool) {
         return;
     }
     app.hidden = hidden;
+    app.taskbar_shown = false;
+    if hidden {
+        tip_hide(app);
+    }
     let cmd = if hidden { SW_HIDE } else { SW_SHOWNOACTIVATE };
     if !app.taskbar_hwnd.is_null() {
         ShowWindow(app.taskbar_hwnd, cmd);
@@ -742,6 +961,7 @@ fn put_tip(nid: &mut NOTIFYICONDATAW, s: &str) {
 unsafe fn show_menu(app: *mut App, hwnd: HWND, metric: Option<Metric>) {
     let a = &mut *app;
     let lang = a.cfg.language;
+    tip_hide(a);
     let menu = CreatePopupMenu();
 
     let checked = |on: bool| MF_STRING | if on { MF_CHECKED } else { 0 };
@@ -883,6 +1103,7 @@ unsafe fn show_menu(app: *mut App, hwnd: HWND, metric: Option<Metric>) {
     let mut pt: POINT = zeroed();
     GetCursorPos(&mut pt);
     SetForegroundWindow(hwnd);
+    a.menu_open = true;
     TrackPopupMenu(
         menu,
         TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
@@ -893,6 +1114,7 @@ unsafe fn show_menu(app: *mut App, hwnd: HWND, metric: Option<Metric>) {
         null(),
     );
     DestroyMenu(menu);
+    a.menu_open = false;
     PostMessageW(hwnd, WM_NULL, 0, 0);
 }
 
@@ -1057,13 +1279,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> L
                     if let Some(fonts) = app.fonts.as_ref() {
                         match ctx.kind {
                             Kind::Taskbar => {
-                                let f = frame(
-                                    app,
-                                    None,
-                                    ctx.hover,
-                                    app.taskbar_vertical,
-                                    app.taskbar_thickness,
-                                );
+                                let f = frame(app, None, ctx.hover);
                                 let look = ui::Look {
                                     transparent: false,
                                     bg: config::parse_color(&app.cfg.bar_bg)
@@ -1074,7 +1290,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> L
                             }
                             Kind::Float(m) => {
                                 let fc = app.cfg.float(m);
-                                let f = frame(app, Some(m), ctx.hover, false, 0);
+                                let f = frame(app, Some(m), ctx.hover);
                                 let edge = if ctx.hover == Some(m) {
                                     Some(app.palette.accent)
                                 } else if fc.border {
@@ -1103,7 +1319,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> L
             if let Some(ctx) = ctx.as_ref() {
                 if let Kind::Taskbar = ctx.kind {
                     if let Some(app) = ctx.app.as_mut() {
-                        refresh(app);
+                        if w == TIMER_ANIM {
+                            animate_led(app);
+                        } else {
+                            refresh(app);
+                        }
                     }
                 }
             }
@@ -1188,6 +1408,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> L
                     if ctx.hover != hover {
                         ctx.hover = hover;
                         InvalidateRect(hwnd, null(), 0);
+                        match hover {
+                            Some(m) => tip_show(&mut *ctx.app, m, hwnd),
+                            None => tip_hide(&mut *ctx.app),
+                        }
                     }
                 }
             }
@@ -1200,6 +1424,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> L
                 if ctx.hover.take().is_some() {
                     InvalidateRect(hwnd, null(), 0);
                 }
+                tip_hide(&mut *ctx.app);
             }
             0
         }
@@ -1264,6 +1489,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> L
                         nid.uID = TRAY_ID;
                         Shell_NotifyIconW(NIM_DELETE, &nid);
                         KillTimer(hwnd, TIMER_ID);
+                        KillTimer(hwnd, TIMER_ANIM);
+                        if !(*app).tip_hwnd.is_null() {
+                            DestroyWindow((*app).tip_hwnd);
+                            (*app).tip_hwnd = null_mut();
+                        }
                         PostQuitMessage(0);
                     }
                 }
@@ -1298,4 +1528,145 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> L
 
 fn ctx_ptr(hwnd: HWND) -> *mut WinCtx {
     unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WinCtx }
+}
+
+unsafe fn register_tip_class() {
+    let hinst = GetModuleHandleW(null());
+    let cls = wide("StatMonTip");
+    let wc = WNDCLASSW {
+        style: 0,
+        lpfnWndProc: Some(wndproc_tip),
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: hinst,
+        hIcon: app_icon(),
+        hCursor: LoadCursorW(null_mut(), IDC_ARROW),
+        hbrBackground: null_mut(),
+        lpszMenuName: null(),
+        lpszClassName: cls.as_ptr(),
+    };
+    RegisterClassW(&wc);
+}
+
+unsafe fn ensure_tip(app: &mut App) {
+    if !app.tip_hwnd.is_null() {
+        return;
+    }
+    register_tip_class();
+    let ptr = app as *mut App;
+    let hwnd = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_LAYERED,
+        wide("StatMonTip").as_ptr(),
+        wide("StatMon").as_ptr(),
+        WS_POPUP,
+        0,
+        0,
+        260,
+        60,
+        null_mut(),
+        null_mut(),
+        GetModuleHandleW(null()),
+        ptr as *const c_void,
+    );
+    if hwnd.is_null() {
+        return;
+    }
+    SetLayeredWindowAttributes(hwnd, 0, 240, LWA_ALPHA);
+    app.tip_hwnd = hwnd;
+}
+
+unsafe fn tip_show(app: &mut App, m: Metric, src: HWND) {
+    ensure_tip(app);
+    if app.tip_hwnd.is_null() {
+        return;
+    }
+    app.tip_metric = Some(m);
+    let mut r: RECT = zeroed();
+    GetWindowRect(src, &mut r);
+    app.tip_anchor_vertical = (r.bottom - r.top) > (r.right - r.left);
+    app.tip_anchor = r;
+    update_tip(app);
+}
+
+unsafe fn tip_hide(app: &mut App) {
+    app.tip_metric = None;
+    if !app.tip_hwnd.is_null() {
+        ShowWindow(app.tip_hwnd, SW_HIDE);
+    }
+}
+
+unsafe fn update_tip(app: &mut App) {
+    let Some(m) = app.tip_metric else {
+        return;
+    };
+    if app.tip_hwnd.is_null() {
+        return;
+    }
+    let f = frame_fit(app, Some(m), None, false, 0, false, false, 0);
+    let (w, h) = ui::tip_size(&f);
+
+    let mut p: POINT = zeroed();
+    GetCursorPos(&mut p);
+    let mon = MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST);
+    let mut mi: MONITORINFO = zeroed();
+    mi.cbSize = size_of::<MONITORINFO>() as u32;
+    let work = if !mon.is_null() && GetMonitorInfoW(mon, &mut mi) != 0 {
+        mi.rcWork
+    } else {
+        RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        }
+    };
+
+    let vertical = app.tip_anchor_vertical;
+    let (mut x, mut y) = if vertical {
+        (app.tip_anchor.left - w - 8, p.y - h / 2)
+    } else {
+        (p.x - w / 2, app.tip_anchor.top - h - 8)
+    };
+    if y < work.top + 4 {
+        y = app.tip_anchor.bottom + 8;
+    }
+    let max_x = (work.right - w).max(work.left);
+    let max_y = (work.bottom - h).max(work.top);
+    x = x.clamp(work.left, max_x);
+    y = y.clamp(work.top, max_y);
+
+    SetWindowPos(
+        app.tip_hwnd,
+        HWND_TOPMOST,
+        x,
+        y,
+        w,
+        h,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW,
+    );
+    InvalidateRect(app.tip_hwnd, null(), 0);
+}
+
+unsafe extern "system" fn wndproc_tip(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRESULT {
+    match msg {
+        WM_NCCREATE => {
+            let cs = &*(l as *const CREATESTRUCTW);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize);
+            DefWindowProcW(hwnd, msg, w, l)
+        }
+        WM_ERASEBKGND => 1,
+        WM_PAINT => {
+            let app = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
+            if !app.is_null() {
+                if let Some(m) = (*app).tip_metric {
+                    if let Some(fonts) = (*app).fonts.as_ref() {
+                        let f = frame_fit(&*app, Some(m), None, false, 0, false, false, 0);
+                        ui::paint_tip(hwnd, &f, fonts, &(*app).palette);
+                    }
+                }
+            }
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, w, l),
+    }
 }

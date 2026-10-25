@@ -325,5 +325,15 @@ impl Metric {
         }
     }
 
+    pub fn index(self) -> usize {
+        match self {
+            Metric::Cpu => 0,
+            Metric::Ram => 1,
+            Metric::Net => 2,
+            Metric::Disk => 3,
+            Metric::Capacity => 4,
+        }
+    }
+
 
 }

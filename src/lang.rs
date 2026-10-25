@@ -99,9 +99,17 @@ pub enum K {
     GraphBar,
     GraphLine,
     GraphPie,
+    GraphLed,
     LabelColor,
     WarnColor,
     ResetColors,
+    Usage,
+    Used,
+    Total,
+    Read,
+    Write,
+    Download,
+    Upload,
 }
 
 fn row(k: K) -> [&'static str; 5] {
@@ -348,6 +356,20 @@ fn row(k: K) -> [&'static str; 5] {
             "Restablecer colores",
             "Renkleri sıfırla",
         ],
+        K::GraphLed => ["LED", "LED", "LED", "LED", "LED"],
+        K::Usage => ["Usage", "Auslastung", "Utilisation", "Uso", "Kullanım"],
+        K::Used => ["Used", "Belegt", "Utilisé", "Usado", "Kullanılan"],
+        K::Total => ["Total", "Gesamt", "Total", "Total", "Toplam"],
+        K::Read => ["Read", "Lesen", "Lecture", "Lectura", "Okuma"],
+        K::Write => ["Write", "Schreiben", "Écriture", "Escritura", "Yazma"],
+        K::Download => [
+            "Download",
+            "Download",
+            "Téléchargement",
+            "Descarga",
+            "İndirme",
+        ],
+        K::Upload => ["Upload", "Upload", "Envoi", "Subida", "Yükleme"],
     }
 }
 

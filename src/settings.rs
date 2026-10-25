@@ -11,7 +11,7 @@ use windows_sys::Win32::Graphics::Gdi::{
     DEFAULT_PITCH, FF_DONTCARE, FW_SEMIBOLD, HBRUSH, HFONT, OUT_DEFAULT_PRECIS, PAINTSTRUCT, Polyline,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::Controls::{SetWindowTheme, BST_CHECKED, BST_UNCHECKED, DRAWITEMSTRUCT};
+use windows_sys::Win32::UI::Controls::{SetWindowTheme, DRAWITEMSTRUCT};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::config::{
@@ -71,6 +71,7 @@ struct Ctx {
     edit: Metric,
     ready: bool,
     loading: bool,
+    checks: u64,
     palette: Palette,
     bg_brush: HBRUSH,
     edit_brush: HBRUSH,
@@ -188,21 +189,74 @@ unsafe fn get_int(h: HWND, def: i32) -> i32 {
     get_text(h).trim().parse::<i32>().unwrap_or(def)
 }
 
-unsafe fn checked(h: HWND) -> bool {
-    SendMessageW(h, BM_GETCHECK, 0, 0) == BST_CHECKED as isize
+fn bit_of(id: usize) -> Option<u32> {
+    if (ID_SHOW_BASE..ID_SHOW_BASE + 5).contains(&id) {
+        Some((id - ID_SHOW_BASE) as u32)
+    } else if (ID_FLOAT_BASE..ID_FLOAT_BASE + 5).contains(&id) {
+        Some(5 + (id - ID_FLOAT_BASE) as u32)
+    } else {
+        match id {
+            ID_TRANS => Some(10),
+            ID_TOP => Some(11),
+            ID_COMPACT => Some(12),
+            ID_WIDGET_BORDER => Some(13),
+            ID_AUTOSTART => Some(14),
+            ID_BAR_TRANS => Some(15),
+            _ => None,
+        }
+    }
 }
 
-unsafe fn check(h: HWND, on: bool) {
-    SendMessageW(
-        h,
-        BM_SETCHECK,
+fn bit_on(checks: u64, id: usize) -> bool {
+    bit_of(id)
+        .map(|b| checks & (1u64 << b) != 0)
+        .unwrap_or(false)
+}
+
+fn bit_set(checks: &mut u64, id: usize, on: bool) {
+    if let Some(b) = bit_of(id) {
         if on {
-            BST_CHECKED as usize
+            *checks |= 1u64 << b;
         } else {
-            BST_UNCHECKED as usize
-        },
-        0,
-    );
+            *checks &= !(1u64 << b);
+        }
+    }
+}
+
+unsafe fn redraw_checks(hwnd: HWND) {
+    for id in (ID_SHOW_BASE..ID_SHOW_BASE + 5)
+        .chain(ID_FLOAT_BASE..ID_FLOAT_BASE + 5)
+        .chain([
+            ID_TRANS,
+            ID_TOP,
+            ID_COMPACT,
+            ID_WIDGET_BORDER,
+            ID_AUTOSTART,
+            ID_BAR_TRANS,
+        ])
+    {
+        let h = GetDlgItem(hwnd, id as i32);
+        if !h.is_null() {
+            InvalidateRect(h, null(), 1);
+        }
+    }
+}
+
+unsafe fn init_checks(hwnd: HWND, ctx: &mut Ctx) {
+    let cfg = &(*ctx.app).cfg;
+    for m in Metric::ALL {
+        let i = Metric::ALL.iter().position(|x| *x == m).unwrap_or(0);
+        bit_set(&mut ctx.checks, ID_SHOW_BASE + i, cfg.shows(m));
+        bit_set(&mut ctx.checks, ID_FLOAT_BASE + i, cfg.float(m).on);
+    }
+    let fc = cfg.float(ctx.edit);
+    bit_set(&mut ctx.checks, ID_TRANS, fc.transparent);
+    bit_set(&mut ctx.checks, ID_TOP, fc.topmost);
+    bit_set(&mut ctx.checks, ID_WIDGET_BORDER, fc.border);
+    bit_set(&mut ctx.checks, ID_COMPACT, cfg.compact);
+    bit_set(&mut ctx.checks, ID_AUTOSTART, autostart_enabled());
+    bit_set(&mut ctx.checks, ID_BAR_TRANS, cfg.bar_transparent);
+    redraw_checks(hwnd);
 }
 
 pub unsafe fn open(app: *mut App, initial: Option<Metric>) {
@@ -252,6 +306,7 @@ pub unsafe fn open(app: *mut App, initial: Option<Metric>) {
         edit,
         ready: false,
         loading: false,
+        checks: 0,
         palette: (*app).palette,
         bg_brush: null_mut(),
         edit_brush: null_mut(),
@@ -287,18 +342,19 @@ pub unsafe fn open(app: *mut App, initial: Option<Metric>) {
     SetForegroundWindow(hwnd);
 }
 
-unsafe fn load_widget(hwnd: HWND, fc: &FloatCfg) {
+unsafe fn load_widget(hwnd: HWND, checks: &mut u64, fc: &FloatCfg) {
     set_text(GetDlgItem(hwnd, ID_WIDGET_BG as i32), &fc.bg);
     set_text(
         GetDlgItem(hwnd, ID_WIDGET_OPACITY as i32),
         &fc.opacity.to_string(),
     );
-    check(GetDlgItem(hwnd, ID_TRANS as i32), fc.transparent);
-    check(GetDlgItem(hwnd, ID_TOP as i32), fc.topmost);
-    check(GetDlgItem(hwnd, ID_WIDGET_BORDER as i32), fc.border);
+    bit_set(checks, ID_TRANS, fc.transparent);
+    bit_set(checks, ID_TOP, fc.topmost);
+    bit_set(checks, ID_WIDGET_BORDER, fc.border);
+    redraw_checks(hwnd);
 }
 
-unsafe fn read_widget(hwnd: HWND, cfg: &mut Config, edit: Metric) {
+unsafe fn read_widget(hwnd: HWND, cfg: &mut Config, edit: Metric, checks: &mut u64) {
     let bg = get_text(GetDlgItem(hwnd, ID_WIDGET_BG as i32));
     let opacity = get_int(GetDlgItem(hwnd, ID_WIDGET_OPACITY as i32), 100).clamp(20, 100);
     let changed_bg = parse_color(&bg)
@@ -309,12 +365,13 @@ unsafe fn read_widget(hwnd: HWND, cfg: &mut Config, edit: Metric) {
         fc.bg = hex_color(c);
     }
     fc.opacity = opacity as u8;
-    fc.transparent = checked(GetDlgItem(hwnd, ID_TRANS as i32));
-    fc.topmost = checked(GetDlgItem(hwnd, ID_TOP as i32));
-    fc.border = checked(GetDlgItem(hwnd, ID_WIDGET_BORDER as i32));
+    fc.transparent = bit_on(*checks, ID_TRANS);
+    fc.topmost = bit_on(*checks, ID_TOP);
+    fc.border = bit_on(*checks, ID_WIDGET_BORDER);
     if changed_bg && fc.transparent {
         fc.transparent = false;
-        check(GetDlgItem(hwnd, ID_TRANS as i32), false);
+        bit_set(checks, ID_TRANS, false);
+        redraw_checks(hwnd);
     }
 }
 
@@ -368,7 +425,7 @@ unsafe fn build_controls(hwnd: HWND, app: &App, edit: Metric, ctx_fonts: (HFONT,
             hwnd,
             "BUTTON",
             tx,
-            (BS_AUTOCHECKBOX as u32) | (BS_OWNERDRAW as u32),
+            BS_OWNERDRAW as u32,
             x,
             y,
             w,
@@ -409,11 +466,8 @@ unsafe fn build_controls(hwnd: HWND, app: &App, edit: Metric, ctx_fonts: (HFONT,
     label(t(lang, K::ChartWidth), 190, 168, 100);
     num(&cfg.graph_width.to_string(), 294, 166, 46, ID_GRAPH_W);
 
-    let compact = checkbox(t(lang, K::Compact), 24, 194, 140, ID_COMPACT);
-    check(compact, cfg.compact);
-
-    let auto = checkbox(t(lang, K::Autostart), 24, 220, 250, ID_AUTOSTART);
-    check(auto, autostart_enabled());
+    checkbox(t(lang, K::Compact), 24, 194, 140, ID_COMPACT);
+    checkbox(t(lang, K::Autostart), 24, 220, 250, ID_AUTOSTART);
 
     section(hwnd, t(lang, K::BarLook), 24, 250, ID_SEC_BAR, section_font);
     label(t(lang, K::Background), 24, 276, 80);
@@ -421,8 +475,7 @@ unsafe fn build_controls(hwnd: HWND, app: &App, edit: Metric, ctx_fonts: (HFONT,
     label(t(lang, K::Opacity), 214, 276, 60);
     num(&cfg.bar_opacity.to_string(), 280, 274, 46, ID_BAR_OPACITY);
     label("%", 330, 276, 14);
-    let bt = checkbox(t(lang, K::BarTransparent), 24, 302, 190, ID_BAR_TRANS);
-    check(bt, cfg.bar_transparent);
+    checkbox(t(lang, K::BarTransparent), 24, 302, 190, ID_BAR_TRANS);
 
     section(hwnd, t(lang, K::Colors), 24, 332, ID_SEC_COLORS, section_font);
     label(t(lang, K::LabelColor), 24, 358, 90);
@@ -465,8 +518,7 @@ unsafe fn build_controls(hwnd: HWND, app: &App, edit: Metric, ctx_fonts: (HFONT,
     for (i, m) in Metric::ALL.iter().enumerate() {
         let y = 102 + i as i32 * 30;
 
-        let b = checkbox(m.label(), 400, y, 50, ID_SHOW_BASE + i);
-        check(b, cfg.shows(*m));
+        checkbox(m.label(), 400, y, 50, ID_SHOW_BASE + i);
 
         let mode = combo(452, y - 2, 114, ID_MODE_BASE + i);
         for v in ViewMode::ALL {
@@ -480,8 +532,7 @@ unsafe fn build_controls(hwnd: HWND, app: &App, edit: Metric, ctx_fonts: (HFONT,
         }
         SendMessageW(g, CB_SETCURSEL, cfg.graph_for(*m).index(), 0);
 
-        let b = checkbox("", 682, y, 24, ID_FLOAT_BASE + i);
-        check(b, cfg.float(*m).on);
+        checkbox("", 682, y, 24, ID_FLOAT_BASE + i);
     }
 
     section(hwnd, t(lang, K::FloatLook), 400, 258, ID_SEC_FLOAT, section_font);
@@ -504,13 +555,9 @@ unsafe fn build_controls(hwnd: HWND, app: &App, edit: Metric, ctx_fonts: (HFONT,
         ID_WIDGET_OPACITY,
     );
     label("%", 504, 312, 14);
-    let tr = checkbox(t(lang, K::Transparent), 520, 308, 104, ID_TRANS);
-    check(tr, cfg.float(edit).transparent);
-    let tp = checkbox(t(lang, K::AlwaysTop), 630, 308, 106, ID_TOP);
-    check(tp, cfg.float(edit).topmost);
-
-    let border = checkbox(t(lang, K::Border), 400, 336, 70, ID_WIDGET_BORDER);
-    check(border, cfg.float(edit).border);
+    checkbox(t(lang, K::Transparent), 520, 308, 104, ID_TRANS);
+    checkbox(t(lang, K::AlwaysTop), 630, 308, 106, ID_TOP);
+    checkbox(t(lang, K::Border), 400, 336, 70, ID_WIDGET_BORDER);
     label(t(lang, K::HintTransparent), 470, 340, 270);
 
     mk(
@@ -553,7 +600,7 @@ unsafe fn color_of(p: &Palette, key: &str) -> [u8; 3] {
     }
 }
 
-unsafe fn save_from(hwnd: HWND, app: &mut App, edit: Metric) {
+unsafe fn save_from(hwnd: HWND, app: &mut App, edit: Metric, checks: &mut u64) {
     let mut cfg = app.cfg.clone();
     let old = cfg.clone();
     let lang = old.language;
@@ -570,7 +617,7 @@ unsafe fn save_from(hwnd: HWND, app: &mut App, edit: Metric) {
         .clamp(8, 48);
     cfg.graph_width = get_int(GetDlgItem(hwnd, ID_GRAPH_W as i32), old.graph_width)
         .clamp(18, 400);
-    cfg.compact = checked(GetDlgItem(hwnd, ID_COMPACT as i32));
+    cfg.compact = bit_on(*checks, ID_COMPACT);
 
     let tsel = SendMessageW(GetDlgItem(hwnd, ID_THEME as i32), CB_GETCURSEL, 0, 0);
     if tsel >= 0 {
@@ -584,7 +631,7 @@ unsafe fn save_from(hwnd: HWND, app: &mut App, edit: Metric) {
     for (i, m) in Metric::ALL.iter().enumerate() {
         cfg.set_show(
             *m,
-            checked(GetDlgItem(hwnd, (ID_SHOW_BASE + i) as i32)),
+            bit_on(*checks, ID_SHOW_BASE + i),
         );
         let sel = SendMessageW(GetDlgItem(hwnd, (ID_MODE_BASE + i) as i32), CB_GETCURSEL, 0, 0);
         if sel >= 0 {
@@ -600,7 +647,7 @@ unsafe fn save_from(hwnd: HWND, app: &mut App, edit: Metric) {
             cfg.set_graph_for(*m, Graph::from_index(g as usize));
         }
         let fc: &mut FloatCfg = cfg.float_mut(*m);
-        fc.on = checked(GetDlgItem(hwnd, (ID_FLOAT_BASE + i) as i32));
+        fc.on = bit_on(*checks, ID_FLOAT_BASE + i);
     }
 
     let bar_bg = get_text(GetDlgItem(hwnd, ID_BAR_BG as i32));
@@ -610,7 +657,7 @@ unsafe fn save_from(hwnd: HWND, app: &mut App, edit: Metric) {
     cfg.bar_opacity =
         get_int(GetDlgItem(hwnd, ID_BAR_OPACITY as i32), cfg.bar_opacity as i32)
             .clamp(20, 100) as u8;
-    cfg.bar_transparent = checked(GetDlgItem(hwnd, ID_BAR_TRANS as i32));
+    cfg.bar_transparent = bit_on(*checks, ID_BAR_TRANS);
 
     for (i, _) in COLOR_KEYS.iter().enumerate() {
         let h = GetDlgItem(hwnd, (ID_COLOR_BASE + i) as i32);
@@ -620,9 +667,9 @@ unsafe fn save_from(hwnd: HWND, app: &mut App, edit: Metric) {
         }
     }
 
-    read_widget(hwnd, &mut cfg, edit);
+    read_widget(hwnd, &mut cfg, edit, checks);
 
-    let want_auto = checked(GetDlgItem(hwnd, ID_AUTOSTART as i32));
+    let want_auto = bit_on(*checks, ID_AUTOSTART);
     if want_auto != autostart_enabled() {
         set_autostart(want_auto);
     }
@@ -631,15 +678,15 @@ unsafe fn save_from(hwnd: HWND, app: &mut App, edit: Metric) {
     set_text(GetDlgItem(hwnd, ID_STATUS as i32), t(lang, K::Applied));
 }
 
-unsafe fn apply_widget_only(hwnd: HWND, app: &mut App, edit: Metric) {
+unsafe fn apply_widget_only(hwnd: HWND, app: &mut App, edit: Metric, checks: &mut u64) {
     let mut cfg = app.cfg.clone();
-    read_widget(hwnd, &mut cfg, edit);
+    read_widget(hwnd, &mut cfg, edit, checks);
     app.cfg = cfg;
     app.save();
     app.restyle();
 }
 
-unsafe fn apply_bar_only(hwnd: HWND, app: &mut App) {
+unsafe fn apply_bar_only(hwnd: HWND, app: &mut App, checks: &mut u64) {
     let mut cfg = app.cfg.clone();
     let bg = get_text(GetDlgItem(hwnd, ID_BAR_BG as i32));
     if let Some(c) = parse_color(&bg) {
@@ -648,7 +695,7 @@ unsafe fn apply_bar_only(hwnd: HWND, app: &mut App) {
     cfg.bar_opacity =
         get_int(GetDlgItem(hwnd, ID_BAR_OPACITY as i32), cfg.bar_opacity as i32)
             .clamp(20, 100) as u8;
-    cfg.bar_transparent = checked(GetDlgItem(hwnd, ID_BAR_TRANS as i32));
+    cfg.bar_transparent = bit_on(*checks, ID_BAR_TRANS);
     app.cfg = cfg;
     app.save();
     crate::apply_bar_style(&*app);
@@ -684,7 +731,7 @@ unsafe fn draw_item(dis: &DRAWITEMSTRUCT, ctx: &Ctx) {
             0x0001 | 0x0004 | 0x0020,
         );
     } else {
-        let on = checked(dis.hwndItem);
+        let on = bit_of(id).map(|b| ctx.checks & (1u64 << b) != 0).unwrap_or(false);
         let size = 16;
         let bx = r.left + 1;
         let by = r.top + (r.bottom - r.top - size) / 2;
@@ -754,6 +801,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> L
                 (*ctx).title_font = title;
                 (*ctx).section_font = sect;
                 build_controls(hwnd, &*(*ctx).app, (*ctx).edit, (title, sect));
+                init_checks(hwnd, &mut *ctx);
                 apply_window_theme(hwnd, &mut *ctx);
                 (*ctx).ready = true;
             }
@@ -773,7 +821,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> L
                         0,
                     );
                     if let Some(app) = (*ctx).app.as_ref() {
-                        load_widget(hwnd, app.cfg.float(m));
+                        load_widget(hwnd, &mut (*ctx).checks, app.cfg.float(m));
                     }
                     (*ctx).loading = false;
                 }
@@ -925,9 +973,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> L
             let ctx = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Ctx;
             if !ctx.is_null() && (*ctx).ready && !(*ctx).loading {
                 let app = (*ctx).app;
+                if code == 0 {
+                    if let Some(b) = bit_of(id) {
+                        let now = (*ctx).checks & (1u64 << b) != 0;
+                        bit_set(&mut (*ctx).checks, id, !now);
+                        let h = GetDlgItem(hwnd, id as i32);
+                        if !h.is_null() {
+                            InvalidateRect(h, null(), 1);
+                        }
+                    }
+                }
                 match id {
                     ID_SAVE => {
-                        save_from(hwnd, &mut *app, (*ctx).edit);
+                        save_from(hwnd, &mut *app, (*ctx).edit, &mut (*ctx).checks);
                         apply_window_theme(hwnd, &mut *ctx);
                     }
                     ID_CLOSE => {
@@ -972,7 +1030,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> L
                                 (*ctx).edit = Metric::ALL[sel as usize];
                                 (*ctx).loading = true;
                                 if let Some(a) = (*ctx).app.as_ref() {
-                                    load_widget(hwnd, a.cfg.float((*ctx).edit));
+                                    load_widget(hwnd, &mut (*ctx).checks, a.cfg.float((*ctx).edit));
                                 }
                                 (*ctx).loading = false;
                             }
@@ -980,17 +1038,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> L
                     }
                     ID_WIDGET_BG | ID_WIDGET_OPACITY => {
                         if code == EN_CHANGE || code == EN_KILLFOCUS {
-                            apply_widget_only(hwnd, &mut *app, (*ctx).edit);
+                            apply_widget_only(hwnd, &mut *app, (*ctx).edit, &mut (*ctx).checks);
                         }
                     }
                     ID_TRANS | ID_TOP | ID_WIDGET_BORDER => {
-                        apply_widget_only(hwnd, &mut *app, (*ctx).edit);
+                        apply_widget_only(hwnd, &mut *app, (*ctx).edit, &mut (*ctx).checks);
                     }
                     ID_BAR_BG | ID_BAR_OPACITY | ID_BAR_TRANS => {
-                        apply_bar_only(hwnd, &mut *app);
+                        apply_bar_only(hwnd, &mut *app, &mut (*ctx).checks);
                     }
                     ID_AUTOSTART => {
-                        let on = checked(GetDlgItem(hwnd, ID_AUTOSTART as i32));
+                        let on = bit_on((*ctx).checks, ID_AUTOSTART);
                         set_autostart(on);
                     }
                     _ => {
@@ -1002,7 +1060,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: usize, l: isize) -> L
                             || (ID_GRAPH_METRIC_BASE..ID_GRAPH_METRIC_BASE + 5).contains(&id)
                             || (ID_COLOR_BASE..ID_COLOR_BASE + 7).contains(&id);
                         if live {
-                            save_from(hwnd, &mut *app, (*ctx).edit);
+                            save_from(hwnd, &mut *app, (*ctx).edit, &mut (*ctx).checks);
                             apply_window_theme(hwnd, &mut *ctx);
                         }
                     }

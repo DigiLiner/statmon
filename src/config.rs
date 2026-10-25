@@ -187,10 +187,17 @@ pub enum Graph {
     Bar,
     Line,
     Pie,
+    Led,
 }
 
 impl Graph {
-    pub const ALL: [Graph; 4] = [Graph::None, Graph::Bar, Graph::Line, Graph::Pie];
+    pub const ALL: [Graph; 5] = [
+        Graph::None,
+        Graph::Bar,
+        Graph::Line,
+        Graph::Pie,
+        Graph::Led,
+    ];
 
     pub fn label_l(self, lang: Lang) -> &'static str {
         t(
@@ -200,6 +207,7 @@ impl Graph {
                 Graph::Bar => K::GraphBar,
                 Graph::Line => K::GraphLine,
                 Graph::Pie => K::GraphPie,
+                Graph::Led => K::GraphLed,
             },
         )
     }
@@ -210,6 +218,7 @@ impl Graph {
             Graph::Bar => 1,
             Graph::Line => 2,
             Graph::Pie => 3,
+            Graph::Led => 4,
         }
     }
 
@@ -253,6 +262,7 @@ pub struct ColorCfg {
     pub net: String,
     pub net_up: String,
     pub disk: String,
+    pub disk_up: String,
     pub cap: String,
 }
 
@@ -272,6 +282,7 @@ impl ColorCfg {
         set(&self.net, &mut p.net);
         set(&self.net_up, &mut p.net_up);
         set(&self.disk, &mut p.disk);
+        set(&self.disk_up, &mut p.disk_up);
         set(&self.cap, &mut p.cap);
     }
 
@@ -286,6 +297,7 @@ impl ColorCfg {
             "net" => self.net = value,
             "net_up" => self.net_up = value,
             "disk" => self.disk = value,
+            "disk_up" => self.disk_up = value,
             "cap" => self.cap = value,
             _ => {}
         }
@@ -449,6 +461,7 @@ pub struct Palette {
     pub net: [u8; 3],
     pub net_up: [u8; 3],
     pub disk: [u8; 3],
+    pub disk_up: [u8; 3],
     pub cap: [u8; 3],
     pub warn: [u8; 3],
     pub divider: [u8; 3],
@@ -465,6 +478,7 @@ const DARK: Palette = Palette {
     net: [255, 185, 72],
     net_up: [180, 140, 255],
     disk: [255, 138, 101],
+    disk_up: [255, 196, 120],
     cap: [197, 217, 122],
     warn: [255, 95, 87],
     divider: [58, 58, 58],
@@ -481,6 +495,7 @@ const LIGHT: Palette = Palette {
     net: [157, 93, 0],
     net_up: [107, 79, 187],
     disk: [196, 62, 28],
+    disk_up: [150, 96, 20],
     cap: [92, 122, 26],
     warn: [196, 43, 28],
     divider: [214, 214, 214],
